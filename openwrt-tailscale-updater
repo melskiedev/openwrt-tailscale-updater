@@ -1,0 +1,1476 @@
+#!/bin/sh
+# openwrt-tailscale-updater
+#
+# Vanilla OpenWrt Tailscale updater.
+# Personal-use script for OpenWrt routers.
+#
+# Supports:
+# - OpenWrt 25.12+ using apk
+# - OpenWrt 24.10 and older using opkg
+#
+# What it does:
+# - Detects architecture
+# - Detects package manager
+# - Detects Tailscale binary paths dynamically (supports /usr/sbin and /usr/bin layouts)
+# - Detects Tailscale init script (/etc/init.d/tailscaled or /etc/init.d/tailscale)
+# - Resolves symlinks before overwriting to avoid breaking tailscale.multicall layouts
+# - Downloads latest stable Tailscale tarball from pkgs.tailscale.com
+# - Backs up current binaries, init script, and /etc/tailscale/
+# - Replaces tailscale and tailscaled at their detected real paths
+# - Restarts the Tailscale init script
+# - Adds key files to /etc/sysupgrade.conf
+#
+# Migration mode (--migrate-from-apk-multicall --yes-i-have-lan-access):
+# - Converts an apk-managed multicall Tailscale install to standalone separate binaries
+# - Removes the apk package entry after successful install so apk no longer tracks Tailscale
+# - Requires confirmation flag --yes-i-have-lan-access because Tailscale will drop briefly
+#
+# What it does NOT do:
+# - Does not run tailscale up automatically
+# - Does not change ACLs, auth, exit-node approval, or DNS settings
+
+set -u
+
+LOGTAG="tailscale-updater"
+STATE_DIR="/root/tailscale-updater"
+BACKUP_DIR="$STATE_DIR/backups"
+TMP_DIR="/tmp/tailscale-update"
+
+FORCE=0
+DRY_RUN=0
+KEEP_TMP=0
+MIGRATE_MULTICALL=0
+CONFIRMED_LAN=0
+ROLLBACK=0
+DELETE_BACKUP=0
+ASSUME_YES=0
+NON_INTERACTIVE=0
+VERBOSE=0
+SELECT_RELEASE=0
+TRACK="stable"
+
+mkdir -p "$STATE_DIR" "$BACKUP_DIR"
+
+
+# ---------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------
+# Theme system
+# ---------------------------------------------------------------
+
+THEME_FILE="$STATE_DIR/theme.conf"
+THEME_NAME="classic"
+UI_BAR=''
+UI_KEY=''
+UI_TITLE=''
+UI_HINT=''
+
+theme_is_valid() {
+    case "$1" in
+        classic|green|amber|ocean|mono) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+theme_can_color() {
+    [ -t 1 ] || return 1
+    [ "${TERM:-dumb}" = "dumb" ] && return 1
+    [ -n "${NO_COLOR:-}" ] && return 1
+    return 0
+}
+
+theme_apply() {
+    THEME_REQUESTED="$1"
+
+    # Use mono at runtime if terminal cannot render color,
+    # but do not overwrite THEME_NAME so the saved preference is preserved.
+    RENDER_THEME="$THEME_REQUESTED"
+    if [ "$RENDER_THEME" != "mono" ] && ! theme_can_color; then
+        RENDER_THEME="mono"
+    fi
+
+    case "$RENDER_THEME" in
+        green)
+            C_RESET='\033[0m'
+            C_RED='\033[0;31m'
+            C_GREEN='\033[0;32m'
+            C_YELLOW='\033[1;33m'
+            C_BLUE='\033[0;36m'
+            C_DIM='\033[0;37m'
+            C_BOLD='\033[1m'
+            UI_BAR='\033[30;42m'
+            UI_KEY='\033[30;41m'
+            UI_TITLE='\033[1;37m'
+            UI_HINT='\033[0;36m'
+            ;;
+        amber)
+            C_RESET='\033[0m'
+            C_RED='\033[0;31m'
+            C_GREEN='\033[0;33m'
+            C_YELLOW='\033[1;33m'
+            C_BLUE='\033[0;33m'
+            C_DIM='\033[0;37m'
+            C_BOLD='\033[1m'
+            UI_BAR='\033[30;43m'
+            UI_KEY='\033[30;47m'
+            UI_TITLE='\033[1;33m'
+            UI_HINT='\033[0;33m'
+            ;;
+        ocean)
+            C_RESET='\033[0m'
+            C_RED='\033[0;31m'
+            C_GREEN='\033[0;36m'
+            C_YELLOW='\033[1;36m'
+            C_BLUE='\033[1;34m'
+            C_DIM='\033[0;37m'
+            C_BOLD='\033[1m'
+            UI_BAR='\033[37;44m'
+            UI_KEY='\033[30;46m'
+            UI_TITLE='\033[1;36m'
+            UI_HINT='\033[0;36m'
+            ;;
+        mono)
+            C_RESET=''
+            C_RED=''
+            C_GREEN=''
+            C_YELLOW=''
+            C_BLUE=''
+            C_DIM=''
+            C_BOLD=''
+            UI_BAR=''
+            UI_KEY=''
+            UI_TITLE=''
+            UI_HINT=''
+            ;;
+        classic|*)
+            C_RESET='\033[0m'
+            C_RED='\033[0;31m'
+            C_GREEN='\033[0;32m'
+            C_YELLOW='\033[0;33m'
+            C_BLUE='\033[0;36m'
+            C_DIM='\033[0;37m'
+            C_BOLD='\033[1m'
+            UI_BAR='\033[30;47m'
+            UI_KEY='\033[37;44m'
+            UI_TITLE='\033[1m'
+            UI_HINT='\033[0;37m'
+            ;;
+    esac
+
+    # Detect UTF-8 support for Unicode box drawing
+    case "${LANG:-}${LC_ALL:-}${LC_CTYPE:-}" in
+        *UTF-8*|*utf-8*|*utf8*)
+            USE_UNICODE=1
+            ;;
+        *)
+            USE_UNICODE=0
+            ;;
+    esac
+}
+
+theme_load() {
+    THEME_NAME="classic"
+    [ -f "$THEME_FILE" ] || return 0
+    SAVED_THEME="$(sed -n 's/^THEME=//p' "$THEME_FILE" | head -n 1)"
+    if theme_is_valid "$SAVED_THEME"; then
+        THEME_NAME="$SAVED_THEME"
+    fi
+}
+
+theme_save() {
+    mkdir -p "$STATE_DIR"
+    printf 'THEME=%s\n' "$THEME_NAME" > "$THEME_FILE"
+}
+
+theme_init() {
+    theme_load
+    theme_apply "$THEME_NAME"
+}
+
+# ---------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------
+
+is_tty() {
+    [ -t 0 ] && [ -t 1 ]
+}
+
+hr() {
+    if [ "${USE_UNICODE:-0}" -eq 1 ]; then
+        printf '══════════════════════════════════════════════════════════════════════\n'
+    else
+        printf '================================================================\n'
+    fi
+}
+
+ui_ok() {
+    printf "${C_GREEN}[OK]${C_RESET} %s\n" "$*"
+}
+
+ui_warn() {
+    printf "${C_YELLOW}[!]${C_RESET} %s\n" "$*"
+}
+
+ui_step() {
+    printf "${C_DIM}[->]${C_RESET} %s\n" "$*"
+}
+
+ui_err() {
+    printf "${C_RED}[ERROR]${C_RESET} %s\n" "$*"
+}
+
+ui_section_bar() {
+    TITLE="$1"
+    if [ -n "$UI_BAR" ]; then
+        printf "${UI_BAR} %-66s ${C_RESET}\n" "$TITLE"
+    else
+        printf '== %s ==\n' "$TITLE"
+    fi
+}
+
+ui_menu_item() {
+    KEY="$1"
+    TEXT="$2"
+    HINT="${3:-}"
+    if [ -n "$UI_KEY" ]; then
+        printf "  ${UI_KEY}%2s${C_RESET}  %s" "$KEY" "$TEXT"
+    else
+        printf "  [%2s] %s" "$KEY" "$TEXT"
+    fi
+    if [ -n "$HINT" ]; then
+        printf "  ${C_DIM}%s${C_RESET}" "$HINT"
+    fi
+    printf '\n'
+}
+
+box() {
+    if [ "${USE_UNICODE:-0}" -eq 1 ]; then
+        printf '┌──────────────────────────────────────────────────────────────────┐\n'
+        while [ $# -gt 0 ]; do
+            printf '│ %-68s │\n' "$1"
+            shift
+        done
+        printf '└──────────────────────────────────────────────────────────────────┘\n'
+    else
+        printf '+------------------------------------------------------------------+\n'
+        while [ $# -gt 0 ]; do
+            printf '| %-64s |\n' "$1"
+            shift
+        done
+        printf '+------------------------------------------------------------------+\n'
+    fi
+}
+
+confirm() {
+    QUESTION="$1"
+    DEFAULT="${2:-n}"
+
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        return 0
+    fi
+
+    if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
+        [ "$DEFAULT" = "y" ] && return 0
+        return 1
+    fi
+
+    if [ "$DEFAULT" = "y" ]; then
+        PROMPT="Y/n"
+    else
+        PROMPT="y/N"
+    fi
+
+    while true; do
+        printf "${C_BLUE}> %s (%s) ${C_RESET}" "$QUESTION" "$PROMPT"
+        read -r ANSWER
+        [ -n "$ANSWER" ] || ANSWER="$DEFAULT"
+        case "$ANSWER" in
+            y|Y|yes|YES) return 0 ;;
+            n|N|no|NO)   return 1 ;;
+            *) ui_warn "Please answer y or n." ;;
+        esac
+    done
+}
+
+
+log() {
+    logger -t "$LOGTAG" "$1" 2>/dev/null || true
+    ui_step "$1"
+}
+
+vlog() {
+    logger -t "$LOGTAG" "$1" 2>/dev/null || true
+    if [ "${VERBOSE:-0}" -eq 1 ]; then
+        ui_step "$1"
+    fi
+}
+
+die() {
+    logger -t "$LOGTAG" "ERROR: $1" 2>/dev/null || true
+    ui_err "$1"
+    exit 1
+}
+
+
+usage() {
+    cat << EOF
+Usage: $0 [options]
+
+Options:
+  --force                                    Reinstall even if latest version appears installed
+  --dry-run                                  Show detected values and latest version, but do not install
+  --keep-tmp                                 Keep downloaded files in /tmp/tailscale-update
+  --yes|-y                                   Skip all confirmation prompts
+  --non-interactive                          Disable all prompts, use defaults
+  --verbose                                  Show detailed detection and operation logs
+  --theme NAME                               Set theme: classic, green, amber, ocean, mono
+  --reset-theme                              Reset saved theme to classic
+  --select-release                           List available releases and choose a specific version
+  --unstable                                 Use the unstable track (odd minor versions, e.g. 1.97.x)
+  --release-candidate                        Use the release-candidate track
+  --migrate-from-apk-multicall               Convert apk-managed multicall install to standalone binaries
+    --yes-i-have-lan-access                  Required confirmation for migration mode
+  --rollback                                 Restore tailscale and tailscaled binaries from a backup
+  --delete-backup                            List available backups and delete selected entries
+  --help                                     Show this help
+
+Examples:
+  $0
+  $0 --force
+  $0 --dry-run
+  $0 --yes
+  $0 --theme green
+  $0 --reset-theme
+  $0 --unstable
+  $0 --release-candidate
+  $0 --select-release
+  $0 --rollback
+  $0 --delete-backup
+  $0 --migrate-from-apk-multicall --yes-i-have-lan-access
+
+Notes:
+  Migration mode removes the apk package entry and installs upstream separate binaries.
+  Tailscale connectivity will drop briefly during migration.
+  Only use migration mode when you have physical or LAN access to the router.
+  After migration, apk will no longer manage Tailscale on this router.
+  This updater intentionally refuses to overwrite tailscale.multicall layouts without
+  explicit migration mode. Use --migrate-from-apk-multicall only on apk-managed routers
+  where tailscale and tailscaled resolve to the same real file.
+EOF
+}
+
+parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --force)
+                FORCE=1
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                ;;
+            --keep-tmp)
+                KEEP_TMP=1
+                ;;
+            --migrate-from-apk-multicall)
+                MIGRATE_MULTICALL=1
+                ;;
+            --yes-i-have-lan-access)
+                CONFIRMED_LAN=1
+                ;;
+            --unstable)
+                TRACK="unstable"
+                ;;
+            --release-candidate)
+                TRACK="release-candidate"
+                ;;
+            --select-release)
+                SELECT_RELEASE=1
+                ;;
+            --verbose)
+                VERBOSE=1
+                ;;
+            --yes|-y)
+                ASSUME_YES=1
+                ;;
+            --non-interactive)
+                NON_INTERACTIVE=1
+                ;;
+            --rollback)
+                ROLLBACK=1
+                ;;
+            --delete-backup)
+                DELETE_BACKUP=1
+                ;;
+            --theme)
+                shift
+                [ "$#" -gt 0 ] || die "--theme requires a value: classic, green, amber, ocean, mono"
+                THEME_REQUESTED="$1"
+                if theme_is_valid "$THEME_REQUESTED"; then
+                    THEME_NAME="$THEME_REQUESTED"
+                    theme_save
+                    theme_apply "$THEME_REQUESTED"
+                    ui_ok "Theme set: $THEME_REQUESTED"
+                else
+                    die "Unknown theme: $THEME_REQUESTED. Valid themes: classic, green, amber, ocean, mono"
+                fi
+                ;;
+            --reset-theme)
+                THEME_NAME="classic"
+                theme_save
+                theme_apply "classic"
+                ui_ok "Theme reset to classic."
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                die "Unknown option: $1"
+                ;;
+        esac
+        shift
+    done
+}
+
+read_openwrt_release() {
+    if [ -f /etc/openwrt_release ]; then
+        # shellcheck disable=SC1091
+        . /etc/openwrt_release
+        OPENWRT_RELEASE="${DISTRIB_RELEASE:-unknown}"
+        OPENWRT_ARCH="${DISTRIB_ARCH:-unknown}"
+        OPENWRT_TARGET="${DISTRIB_TARGET:-unknown}"
+    else
+        die "This does not look like OpenWrt. Missing /etc/openwrt_release"
+    fi
+}
+
+detect_pkg_manager() {
+    if command -v apk >/dev/null 2>&1; then
+        PKG_MANAGER="apk"
+        PKG_UPDATE="apk update"
+        PKG_INSTALL="apk add"
+        vlog "Detected package manager: apk"
+        return 0
+    fi
+
+    if command -v opkg >/dev/null 2>&1; then
+        PKG_MANAGER="opkg"
+        PKG_UPDATE="opkg update"
+        PKG_INSTALL="opkg install"
+        vlog "Detected package manager: opkg"
+        return 0
+    fi
+
+    die "No supported package manager found. Expected apk on OpenWrt 25.12+ or opkg on older OpenWrt."
+}
+
+install_pkg_if_missing() {
+    BIN_NAME="$1"
+    PKG_NAME="${2:-$1}"
+
+    if command -v "$BIN_NAME" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    log "Missing dependency: $BIN_NAME"
+    log "Installing package: $PKG_NAME"
+
+    $PKG_UPDATE || die "$PKG_MANAGER update failed"
+    $PKG_INSTALL "$PKG_NAME" || die "$PKG_MANAGER install failed for $PKG_NAME"
+}
+
+detect_arch() {
+    MACHINE_ARCH="$(uname -m)"
+
+    case "$MACHINE_ARCH" in
+        aarch64)
+            TS_ARCH="arm64"
+            ;;
+        armv7l|armv7*)
+            TS_ARCH="arm"
+            ;;
+        armv6l|armv6*)
+            TS_ARCH="arm"
+            ;;
+        x86_64)
+            TS_ARCH="amd64"
+            ;;
+        i386|i686)
+            TS_ARCH="386"
+            ;;
+        mips)
+            case "${OPENWRT_ARCH:-}" in
+                *mipsel*|*mips_24kc*)
+                    TS_ARCH="mipsle"
+                    ;;
+                *)
+                    TS_ARCH="mips"
+                    ;;
+            esac
+            ;;
+        mipsel)
+            TS_ARCH="mipsle"
+            ;;
+        *)
+            die "Unsupported CPU architecture: $MACHINE_ARCH"
+            ;;
+    esac
+
+    vlog "Detected OpenWrt release: $OPENWRT_RELEASE"
+    vlog "Detected OpenWrt arch: $OPENWRT_ARCH"
+    vlog "Detected OpenWrt target: $OPENWRT_TARGET"
+    vlog "Detected CPU arch: $MACHINE_ARCH"
+    vlog "Mapped Tailscale arch: $TS_ARCH"
+}
+
+handle_multicall_choice() {
+    if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
+        log "Detected multicall Tailscale layout:"
+        log "  $TAILSCALE_BIN -> $TAILSCALE_REAL"
+        log "  $TAILSCALED_BIN -> $TAILSCALED_REAL"
+        log "This updater does not overwrite shared multicall binaries."
+        log "Use the OpenWrt package manager instead:"
+        if [ "${PKG_MANAGER:-}" = "apk" ]; then
+            log "  apk update && apk upgrade tailscale"
+        else
+            log "  opkg update && opkg upgrade tailscale"
+        fi
+        log "To convert this router to standalone upstream binaries, run:"
+        log "  $0 --migrate-from-apk-multicall --yes-i-have-lan-access"
+        die "Refusing to overwrite multicall layout."
+    fi
+
+    hr
+    printf '\n'
+    ui_warn "This router uses a package-managed multicall Tailscale install."
+    ui_warn "tailscale and tailscaled resolve to the same real file."
+    printf '\n'
+    printf "  ${C_BOLD}[1]${C_RESET} Stay package-managed\n"
+    if [ "${PKG_MANAGER:-}" = "apk" ]; then
+        printf "      Run: apk update && apk upgrade tailscale\n"
+    else
+        printf "      Run: opkg update && opkg upgrade tailscale\n"
+    fi
+    printf '\n'
+    printf "  ${C_BOLD}[2]${C_RESET} Migrate to standalone upstream binaries\n"
+    printf "      Removes the package manager's Tailscale ownership.\n"
+    printf "      Tailscale will drop briefly during migration.\n"
+    printf "      Use only with physical or LAN access.\n"
+    printf '\n'
+    printf "  ${C_DIM}[c] Cancel${C_RESET}\n"
+    printf '\n'
+
+    while true; do
+        printf "${C_BLUE}> Select [1, 2, or c]: ${C_RESET}"
+        read -r CHOICE
+        case "$CHOICE" in
+            1)
+                printf '\n'
+                if [ "${PKG_MANAGER:-}" = "apk" ]; then
+                    ui_step "Run: apk update && apk upgrade tailscale"
+                else
+                    ui_step "Run: opkg update && opkg upgrade tailscale"
+                fi
+                exit 0
+                ;;
+            2)
+                printf '\n'
+                printf "${C_BLUE}> Confirm you have physical or LAN access to this router (type YES): ${C_RESET}"
+                read -r CONFIRM_ACCESS
+                [ "$CONFIRM_ACCESS" = "YES" ] || die "Migration cancelled. LAN access was not confirmed."
+                MIGRATE_MULTICALL=1
+                CONFIRMED_LAN=1
+                return 0
+                ;;
+            c|C)
+                log "Cancelled by user."
+                exit 0
+                ;;
+            *)
+                ui_warn "Please select 1, 2, or c."
+                ;;
+        esac
+    done
+}
+
+detect_tailscale_paths() {
+    TAILSCALE_BIN="$(command -v tailscale 2>/dev/null || true)"
+    TAILSCALED_BIN="$(command -v tailscaled 2>/dev/null || true)"
+
+    # Fallback: probe common OpenWrt install paths
+    [ -z "$TAILSCALE_BIN" ] && [ -x /usr/sbin/tailscale ] && TAILSCALE_BIN="/usr/sbin/tailscale"
+    [ -z "$TAILSCALE_BIN" ] && [ -x /usr/bin/tailscale ]  && TAILSCALE_BIN="/usr/bin/tailscale"
+
+    [ -z "$TAILSCALED_BIN" ] && [ -x /usr/sbin/tailscaled ] && TAILSCALED_BIN="/usr/sbin/tailscaled"
+    [ -z "$TAILSCALED_BIN" ] && [ -x /usr/bin/tailscaled ]  && TAILSCALED_BIN="/usr/bin/tailscaled"
+
+    [ -n "$TAILSCALE_BIN" ]  || die "tailscale binary not found"
+    [ -n "$TAILSCALED_BIN" ] || die "tailscaled binary not found"
+
+    # Resolve symlinks so we install to the real target file, not the symlink path.
+    # This protects tailscale.multicall layouts from being broken.
+    TAILSCALE_REAL="$(readlink -f "$TAILSCALE_BIN")"
+    TAILSCALED_REAL="$(readlink -f "$TAILSCALED_BIN")"
+
+    [ -n "$TAILSCALE_REAL" ]  || die "Could not resolve real path for $TAILSCALE_BIN"
+    [ -n "$TAILSCALED_REAL" ] || die "Could not resolve real path for $TAILSCALED_BIN"
+
+    # Guard against multicall layouts where both binaries resolve to the same real file.
+    if [ "$TAILSCALE_REAL" = "$TAILSCALED_REAL" ]; then
+        if [ "$MIGRATE_MULTICALL" -eq 1 ]; then
+            vlog "Multicall layout detected. Migration mode active, proceeding."
+            vlog "  $TAILSCALE_BIN -> $TAILSCALE_REAL"
+            vlog "  $TAILSCALED_BIN -> $TAILSCALED_REAL"
+            TAILSCALE_REAL="$(dirname "$TAILSCALED_REAL")/tailscale"
+            vlog "  tailscale will be installed as a new separate binary at: $TAILSCALE_REAL"
+        else
+            handle_multicall_choice
+            TAILSCALE_REAL="$(dirname "$TAILSCALED_REAL")/tailscale"
+        fi
+    fi
+
+    vlog "Detected tailscale binary:  $TAILSCALE_BIN -> $TAILSCALE_REAL"
+    vlog "Detected tailscaled binary: $TAILSCALED_BIN -> $TAILSCALED_REAL"
+}
+
+detect_tailscaled_service() {
+    if [ -x /etc/init.d/tailscaled ]; then
+        TAILSCALED_INIT="/etc/init.d/tailscaled"
+    elif [ -x /etc/init.d/tailscale ]; then
+        TAILSCALED_INIT="/etc/init.d/tailscale"
+    else
+        die "No Tailscale init script found. Expected /etc/init.d/tailscaled or /etc/init.d/tailscale"
+    fi
+
+    vlog "Detected init script: $TAILSCALED_INIT"
+}
+
+preflight() {
+    read_openwrt_release
+    detect_pkg_manager
+    detect_arch
+
+    command -v readlink >/dev/null 2>&1 || die "readlink is missing"
+    readlink -f / >/dev/null 2>&1 || die "readlink -f is not supported on this system"
+
+    detect_tailscale_paths
+    detect_tailscaled_service
+
+    install_pkg_if_missing wget wget
+    install_pkg_if_missing tar tar
+    install_pkg_if_missing gzip gzip
+
+    [ -d /etc/tailscale ] || mkdir -p /etc/tailscale
+
+    FREE_TMP_KB="$(df -P /tmp | awk 'NR==2 {print $4}')"
+    [ -n "$FREE_TMP_KB" ] || die "Could not check free space on /tmp"
+
+    if [ "$FREE_TMP_KB" -lt 60000 ]; then
+        die "Not enough /tmp space. Need at least 60 MB free. Current free KB: $FREE_TMP_KB"
+    fi
+
+    vlog "Preflight passed"
+}
+
+validate_migration_preconditions() {
+    # Must be apk-managed
+    [ "$PKG_MANAGER" = "apk" ] || die "Migration mode only supported on apk-managed routers."
+
+    # Tailscale must be installed via apk
+    apk list --installed 2>/dev/null | grep -qi '^tailscale' || \
+        die "Tailscale does not appear to be apk-managed on this router."
+
+    # /etc/tailscale/ must exist to preserve node identity
+    [ -d /etc/tailscale ] || die "/etc/tailscale/ not found. Cannot safely migrate without node state."
+
+    # Init script must exist
+    [ -x "$TAILSCALED_INIT" ] || die "Init script $TAILSCALED_INIT not found or not executable."
+
+    # LAN confirmation required
+    [ "$CONFIRMED_LAN" -eq 1 ] || \
+        die "Migration mode requires --yes-i-have-lan-access. Tailscale will drop briefly during migration."
+
+    log "Migration preconditions passed"
+}
+
+current_version() {
+    if [ -x "$TAILSCALE_BIN" ]; then
+        CURRENT_VERSION="$($TAILSCALE_BIN version 2>/dev/null | awk 'NR==1 {print $1}')"
+    else
+        CURRENT_VERSION="not-installed"
+    fi
+
+    [ -n "$CURRENT_VERSION" ] || CURRENT_VERSION="unknown"
+
+    # Detect likely track from minor version parity only.
+    # Even minor = stable or release-candidate. Odd minor = unstable.
+    # Patch version alone cannot distinguish stable from RC reliably.
+    CURRENT_TRACK="unknown"
+    if [ "$CURRENT_VERSION" != "not-installed" ] && [ "$CURRENT_VERSION" != "unknown" ]; then
+        MINOR="$(echo "$CURRENT_VERSION" | cut -d. -f2)"
+        case "$MINOR" in
+            ''|*[!0-9]*)
+                CURRENT_TRACK="unknown"
+                ;;
+            *)
+                if [ $((MINOR % 2)) -ne 0 ]; then
+                    CURRENT_TRACK="unstable"
+                else
+                    CURRENT_TRACK="stable/rc"
+                fi
+                ;;
+        esac
+    fi
+}
+
+find_latest_release() {
+    PKG_URL_BASE="https://pkgs.tailscale.com/${TRACK}"
+    ui_step "Checking latest release from $PKG_URL_BASE"
+
+    if [ "$TRACK" = "unstable" ]; then
+        ui_warn "Unstable track selected. These builds are not recommended for production."
+    elif [ "$TRACK" = "release-candidate" ]; then
+        ui_warn "Release candidate track selected. Use with caution."
+    fi
+
+    INDEX_FILE="$TMP_DIR/index.html"
+    rm -rf "$TMP_DIR"
+    mkdir -p "$TMP_DIR"
+
+    wget -q -O "$INDEX_FILE" "$PKG_URL_BASE/" || die "Failed to fetch Tailscale package index"
+
+    if [ "$SELECT_RELEASE" -eq 1 ]; then
+        if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
+            die "--select-release requires an interactive terminal."
+        fi
+        # Build list of all available versions for this arch
+        VERSION_LIST="$(
+            grep -o "tailscale_[0-9][^\" ]*_${TS_ARCH}\.tgz" "$INDEX_FILE" \
+            | sed -n 's/^tailscale_\([^_]*\)_.*/\1/p' \
+            | sort -t. -k1,1rn -k2,2rn -k3,3rn
+        )"
+
+        [ -n "$VERSION_LIST" ] || die "Could not find any Tailscale releases for arch: $TS_ARCH"
+
+        hr
+        printf '\n'
+        ui_step "Available releases for $TS_ARCH:"
+        printf '\n'
+
+        i=1
+        for v in $VERSION_LIST; do
+            if [ "$v" = "$(echo "$VERSION_LIST" | head -n 1)" ]; then
+                printf "  ${C_BOLD}[%s]${C_RESET} ${C_GREEN}%s${C_RESET}  ${C_DIM}(latest)${C_RESET}\n" "$i" "$v"
+            else
+                printf "  ${C_BOLD}[%s]${C_RESET} %s\n" "$i" "$v"
+            fi
+            i=$((i + 1))
+        done
+
+        printf '\n'
+        printf "  ${C_DIM}[c] Cancel${C_RESET}\n"
+        printf '\n'
+        printf "${C_YELLOW}[!]${C_RESET} Downgrading is not officially supported by Tailscale.\n"
+        printf '\n'
+        printf "${C_BLUE}> Select release to install [1-%d or c]: ${C_RESET}" "$((i - 1))"
+        read -r SELECTION
+
+        if [ "$SELECTION" = "c" ] || [ "$SELECTION" = "C" ]; then
+            log "Cancelled."
+            cleanup
+            exit 0
+        fi
+
+        case "$SELECTION" in
+            ''|*[!0-9]*) die "Invalid selection." ;;
+        esac
+
+        if [ "$SELECTION" -lt 1 ] || [ "$SELECTION" -gt "$((i - 1))" ]; then
+            die "Selection out of range."
+        fi
+
+        SELECTED_VERSION="$(echo "$VERSION_LIST" | awk "NR==$SELECTION")"
+        ARCHIVE_NAME="tailscale_${SELECTED_VERSION}_${TS_ARCH}.tgz"
+        LATEST_VERSION="$SELECTED_VERSION"
+        DOWNLOAD_URL="$PKG_URL_BASE/$ARCHIVE_NAME"
+
+        ui_ok "Selected version: $LATEST_VERSION"
+    else
+        ARCHIVE_NAME="$(
+            grep -o "tailscale_[0-9][^\" ]*_${TS_ARCH}\.tgz" "$INDEX_FILE" \
+            | head -n 1
+        )"
+
+        [ -n "$ARCHIVE_NAME" ] || die "Could not find Tailscale archive for arch: $TS_ARCH"
+
+        LATEST_VERSION="$(echo "$ARCHIVE_NAME" | sed -n 's/^tailscale_\([^_]*\)_.*/\1/p')"
+        DOWNLOAD_URL="$PKG_URL_BASE/$ARCHIVE_NAME"
+
+        [ -n "$LATEST_VERSION" ] || die "Could not parse latest version from archive name: $ARCHIVE_NAME"
+
+        ui_ok "Current version: $CURRENT_VERSION ($CURRENT_TRACK)"
+        ui_ok "Latest version:  $LATEST_VERSION ($TRACK)"
+        ui_ok "Archive:         $ARCHIVE_NAME"
+    fi
+}
+
+backup_current() {
+    TS="$(date +%Y%m%d-%H%M%S)"
+    BACKUP_FILE="$BACKUP_DIR/tailscale-backup-${CURRENT_VERSION}-$TS.tar.gz"
+
+    log "Creating backup: $BACKUP_FILE"
+
+    tar czf "$BACKUP_FILE" \
+        "$TAILSCALE_BIN" \
+        "$TAILSCALED_BIN" \
+        "$TAILSCALE_REAL" \
+        "$TAILSCALED_REAL" \
+        "$TAILSCALED_INIT" \
+        /etc/tailscale \
+        2>/dev/null || die "Backup failed"
+
+    log "Backup complete: $BACKUP_FILE"
+}
+
+do_rollback() {
+    hr
+    printf '\n'
+    ui_step "Available backups:"
+    printf '\n'
+
+    BACKUP_LIST="$(find "$BACKUP_DIR" -maxdepth 1 -name 'tailscale-backup-*.tar.gz' | sort -r)"
+
+    [ -n "$BACKUP_LIST" ] || die "No backups found in $BACKUP_DIR"
+
+    i=1
+    for f in $BACKUP_LIST; do
+        FNAME="$(basename "$f")"
+        VER="$(echo "$FNAME" | sed -n 's/^tailscale-backup-\([0-9][^-]*\.[^-]*\.[^-]*\)-.*/\1/p')"
+        TS="$(echo "$FNAME" | sed -n 's/^tailscale-backup-[0-9][^-]*\.[^-]*\.[^-]*-\(.*\)\.tar\.gz$/\1/p')"
+        if [ -z "$VER" ]; then
+            VER="unknown"
+            TS="$(echo "$FNAME" | sed -n 's/^tailscale-backup-\(.*\)\.tar\.gz$/\1/p')"
+        fi
+        printf "  ${C_BOLD}[%s]${C_RESET} version ${C_GREEN}%s${C_RESET}  (%s)  %s\n" "$i" "$VER" "$TS" "$FNAME"
+        i=$((i + 1))
+    done
+
+    printf '\n'
+    printf "  ${C_DIM}[c] Cancel${C_RESET}\n"
+    printf '\n'
+    printf "${C_BLUE}> Select backup to restore [1-%d or c]: ${C_RESET}" "$((i - 1))"
+    read -r SELECTION
+
+    if [ "$SELECTION" = "c" ] || [ "$SELECTION" = "C" ]; then
+        log "Rollback cancelled."
+        return 0
+    fi
+
+    # Validate input is a number in range
+    case "$SELECTION" in
+        ''|*[!0-9]*)
+            die "Invalid selection."
+            ;;
+    esac
+
+    if [ "$SELECTION" -lt 1 ] || [ "$SELECTION" -gt "$((i - 1))" ]; then
+        die "Selection out of range."
+    fi
+
+    # Pick the selected backup
+    SELECTED_BACKUP="$(echo "$BACKUP_LIST" | awk "NR==$SELECTION")"
+    [ -f "$SELECTED_BACKUP" ] || die "Selected backup file not found: $SELECTED_BACKUP"
+
+    log "Restoring from: $(basename "$SELECTED_BACKUP")"
+
+    # Extract to temp dir
+    ROLLBACK_TMP="/tmp/tailscale-rollback"
+    rm -rf "$ROLLBACK_TMP"
+    mkdir -p "$ROLLBACK_TMP"
+
+    tar xzf "$SELECTED_BACKUP" -C "$ROLLBACK_TMP" || die "Failed to extract backup"
+
+    # Stop daemon before restoring
+    log "Stopping tailscaled"
+    "$TAILSCALED_INIT" stop 2>/dev/null || true
+    sleep 3
+    if pidof tailscaled >/dev/null 2>&1; then
+        killall tailscaled 2>/dev/null || true
+        sleep 2
+    fi
+
+    # Restore binaries from backup
+    ROLLBACK_TAILSCALE="${ROLLBACK_TMP}${TAILSCALE_REAL}"
+    ROLLBACK_TAILSCALED="${ROLLBACK_TMP}${TAILSCALED_REAL}"
+
+    [ -f "$ROLLBACK_TAILSCALE" ]  || die "tailscale binary not found in backup"
+    [ -f "$ROLLBACK_TAILSCALED" ] || die "tailscaled binary not found in backup"
+
+    cp "$ROLLBACK_TAILSCALE"  "$TAILSCALE_REAL"  || die "Failed to restore tailscale binary"
+    cp "$ROLLBACK_TAILSCALED" "$TAILSCALED_REAL" || die "Failed to restore tailscaled binary"
+    chmod +x "$TAILSCALE_REAL" "$TAILSCALED_REAL"
+
+    log "Binaries restored"
+    "$TAILSCALE_REAL" version || die "Restored tailscale binary failed to run"
+
+    # Restart
+    "$TAILSCALED_INIT" enable 2>/dev/null || true
+    "$TAILSCALED_INIT" start || die "Failed to start tailscaled after rollback"
+    sleep 8
+    pidof tailscaled >/dev/null 2>&1 || die "tailscaled did not start after rollback"
+
+    log "Rollback complete. Running version: $("$TAILSCALE_REAL" version 2>/dev/null | awk 'NR==1 {print $1}')"
+
+    rm -rf "$ROLLBACK_TMP"
+}
+
+do_delete_backup() {
+    hr
+    printf '\n'
+    ui_step "Available backups:"
+    printf '\n'
+
+    BACKUP_LIST="$(find "$BACKUP_DIR" -maxdepth 1 -name 'tailscale-backup-*.tar.gz' | sort -r)"
+
+    [ -n "$BACKUP_LIST" ] || die "No backups found in $BACKUP_DIR"
+
+    i=1
+    for f in $BACKUP_LIST; do
+        FNAME="$(basename "$f")"
+        VER="$(echo "$FNAME" | sed -n 's/^tailscale-backup-\([0-9][^-]*\.[^-]*\.[^-]*\)-.*/\1/p')"
+        TS="$(echo "$FNAME" | sed -n 's/^tailscale-backup-[0-9][^-]*\.[^-]*\.[^-]*-\(.*\)\.tar\.gz$/\1/p')"
+        if [ -z "$VER" ]; then
+            VER="unknown"
+            TS="$(echo "$FNAME" | sed -n 's/^tailscale-backup-\(.*\)\.tar\.gz$/\1/p')"
+        fi
+        SIZE="$(du -sh "$f" 2>/dev/null | awk '{print $1}')"
+        printf "  ${C_BOLD}[%s]${C_RESET} version ${C_GREEN}%s${C_RESET}  (%s)  %s  %s\n" "$i" "$VER" "$TS" "$SIZE" "$FNAME"
+        i=$((i + 1))
+    done
+
+    printf '\n'
+    printf "  ${C_YELLOW}[a] Delete ALL backups${C_RESET}\n"
+    printf "  ${C_DIM}[c] Cancel${C_RESET}\n"
+    printf '\n'
+    printf "${C_BLUE}> Select backup to delete [1-%d, a, or c]: ${C_RESET}" "$((i - 1))"
+    read -r SELECTION
+
+    if [ "$SELECTION" = "c" ] || [ "$SELECTION" = "C" ]; then
+        log "Cancelled."
+        return 0
+    fi
+
+    if [ "$SELECTION" = "a" ]; then
+        printf "Delete ALL backups? This cannot be undone. [y/N]: "
+        read -r CONFIRM
+        case "$CONFIRM" in
+            y|Y)
+                rm -f "$BACKUP_DIR"/tailscale-backup-*.tar.gz
+                log "All backups deleted."
+                ;;
+            *)
+                log "Cancelled."
+                ;;
+        esac
+        return 0
+    fi
+
+    case "$SELECTION" in
+        ''|*[!0-9]*)
+            die "Invalid selection."
+            ;;
+    esac
+
+    if [ "$SELECTION" -lt 1 ] || [ "$SELECTION" -gt "$((i - 1))" ]; then
+        die "Selection out of range."
+    fi
+
+    SELECTED_BACKUP="$(echo "$BACKUP_LIST" | awk "NR==$SELECTION")"
+    [ -f "$SELECTED_BACKUP" ] || die "Selected backup file not found: $SELECTED_BACKUP"
+
+    printf "Delete %s? [y/N]: " "$(basename "$SELECTED_BACKUP")"
+    read -r CONFIRM
+    case "$CONFIRM" in
+        y|Y)
+            rm -f "$SELECTED_BACKUP"
+            log "Deleted: $(basename "$SELECTED_BACKUP")"
+            ;;
+        *)
+            log "Cancelled."
+            ;;
+    esac
+}
+
+download_release() {
+    log "Downloading: $DOWNLOAD_URL"
+
+    wget -q -O "$TMP_DIR/tailscale.tgz" "$DOWNLOAD_URL" || die "Download failed"
+
+    log "Extracting archive"
+    tar xzf "$TMP_DIR/tailscale.tgz" -C "$TMP_DIR" || die "Extract failed"
+
+    EXTRACT_DIR="$(find "$TMP_DIR" -maxdepth 1 -type d -name 'tailscale_*' | head -n 1)"
+    [ -n "$EXTRACT_DIR" ] || die "Extracted directory not found"
+
+    [ -f "$EXTRACT_DIR/tailscale" ]  || die "tailscale binary missing from archive"
+    [ -f "$EXTRACT_DIR/tailscaled" ] || die "tailscaled binary missing from archive"
+
+    log "Archive extracted: $EXTRACT_DIR"
+}
+
+stop_tailscaled() {
+    log "Stopping tailscaled"
+
+    "$TAILSCALED_INIT" stop 2>/dev/null || true
+    sleep 3
+
+    if pidof tailscaled >/dev/null 2>&1; then
+        log "tailscaled still running, killing process"
+        killall tailscaled 2>/dev/null || true
+        sleep 2
+    fi
+}
+
+remove_apk_package() {
+    log "Removing apk package entry for tailscale"
+    log "Note: binaries and init script will be restored from backup if apk removes them"
+
+    # Save init script before apk del in case apk removes it
+    INIT_BACKUP="$STATE_DIR/tailscaled.init.bak"
+    cp "$TAILSCALED_INIT" "$INIT_BACKUP" || die "Failed to backup init script before apk del"
+
+    apk del tailscale || log "WARN: apk del tailscale returned non-zero. Continuing."
+
+    # Restore init script if apk del removed it
+    if [ ! -x "$TAILSCALED_INIT" ]; then
+        log "Init script was removed by apk del, restoring from backup"
+        cp "$INIT_BACKUP" "$TAILSCALED_INIT" || die "Failed to restore init script"
+        chmod +x "$TAILSCALED_INIT"
+        log "Init script restored: $TAILSCALED_INIT"
+    fi
+
+    log "apk package entry removed"
+}
+
+ensure_kmod_tun() {
+    log "Ensuring kmod-tun is installed"
+
+    if [ "$PKG_MANAGER" = "apk" ]; then
+        apk list --installed 2>/dev/null | grep -qi '^kmod-tun' || apk add kmod-tun || die "Failed to install kmod-tun"
+    elif [ "$PKG_MANAGER" = "opkg" ]; then
+        opkg list-installed 2>/dev/null | grep -qi '^kmod-tun' || opkg install kmod-tun || die "Failed to install kmod-tun"
+    fi
+
+    [ -e /dev/net/tun ] || die "/dev/net/tun missing after kmod-tun install"
+
+    log "kmod-tun OK"
+}
+
+ensure_init_compat_symlink() {
+    if [ -x /etc/init.d/tailscale ] && [ ! -e /etc/init.d/tailscaled ]; then
+        log "Creating compatibility symlink: /etc/init.d/tailscaled -> /etc/init.d/tailscale"
+        ln -sf /etc/init.d/tailscale /etc/init.d/tailscaled
+    fi
+}
+
+install_binaries() {
+    log "Installing new binaries"
+
+    cp "$EXTRACT_DIR/tailscale"  "$TAILSCALE_REAL"  || die "Failed to copy tailscale binary to $TAILSCALE_REAL"
+    cp "$EXTRACT_DIR/tailscaled" "$TAILSCALED_REAL" || die "Failed to copy tailscaled binary to $TAILSCALED_REAL"
+
+    chmod +x "$TAILSCALE_REAL" "$TAILSCALED_REAL"
+
+    log "Installed binaries:"
+    "$TAILSCALE_REAL" version || die "New tailscale binary failed to run"
+}
+
+start_tailscaled() {
+    log "Starting tailscaled"
+
+    "$TAILSCALED_INIT" enable 2>/dev/null || true
+    "$TAILSCALED_INIT" start || die "Failed to start tailscaled"
+
+    sleep 8
+
+    pidof tailscaled >/dev/null 2>&1 || die "tailscaled did not start"
+
+    log "tailscaled is running"
+}
+
+verify_install() {
+    log "Verifying Tailscale status"
+
+    "$TAILSCALE_REAL" version || die "tailscale version check failed"
+
+    if "$TAILSCALE_REAL" status >/dev/null 2>&1; then
+        log "tailscale status OK"
+    else
+        log "WARN: tailscale status failed. This can happen if the node is not authenticated yet."
+    fi
+}
+
+ensure_sysupgrade_persistence() {
+    log "Updating /etc/sysupgrade.conf"
+
+    touch /etc/sysupgrade.conf
+
+    for path in \
+        "$TAILSCALE_REAL" \
+        "$TAILSCALED_REAL" \
+        "$TAILSCALED_INIT" \
+        /etc/init.d/tailscale \
+        /etc/init.d/tailscaled \
+        /etc/tailscale/ \
+        /usr/bin/tailscale-watchdog.sh \
+        /usr/bin/openwrt-tailscale-updater \
+        /root/tailscale-updater/
+    do
+        grep -qxF "$path" /etc/sysupgrade.conf || echo "$path" >> /etc/sysupgrade.conf
+    done
+
+    log "sysupgrade persistence updated"
+}
+
+cleanup() {
+    if [ "$KEEP_TMP" -eq 1 ]; then
+        log "Keeping temp directory: $TMP_DIR"
+    else
+        rm -rf "$TMP_DIR"
+    fi
+}
+
+interactive_preflight_display() {
+    hr
+    ui_step "Checking prerequisites"
+    printf '\n'
+    ui_ok  "OpenWrt $OPENWRT_RELEASE detected"
+    ui_ok  "Package manager: $PKG_MANAGER"
+    ui_ok  "Architecture: $MACHINE_ARCH -> $TS_ARCH"
+    FREE_TMP_MB="$((FREE_TMP_KB / 1024))"
+    ui_ok  "Free space in /tmp: ${FREE_TMP_MB} MB"
+    printf '\n'
+    ui_ok  "tailscale:   $TAILSCALE_REAL"
+    ui_ok  "tailscaled:  $TAILSCALED_REAL"
+    ui_ok  "Init script: $TAILSCALED_INIT"
+    printf '\n'
+    ui_ok  "Installed version: $CURRENT_VERSION ($CURRENT_TRACK)"
+    printf '\n'
+    ui_ok  "Prerequisites are met."
+    printf '\n'
+}
+
+interactive_update_summary() {
+    hr
+    printf '\n'
+    box \
+        "Router:            $OPENWRT_TARGET" \
+        "Architecture:      $MACHINE_ARCH -> $TS_ARCH" \
+        "Package manager:   $PKG_MANAGER" \
+        "tailscale:         $TAILSCALE_REAL" \
+        "tailscaled:        $TAILSCALED_REAL" \
+        "Init script:       $TAILSCALED_INIT" \
+        "Installed version: $CURRENT_VERSION ($CURRENT_TRACK)" \
+        "Target track:      $TRACK" \
+        "Latest version:    $LATEST_VERSION"
+    printf '\n'
+    if [ "$TRACK" = "unstable" ]; then
+        ui_warn "You selected the UNSTABLE track. Not recommended for production routers."
+    elif [ "$TRACK" = "release-candidate" ]; then
+        ui_warn "You selected the RELEASE CANDIDATE track. Use only for testing."
+    fi
+    ui_warn "Tailscale will be stopped briefly during the update."
+    ui_warn "A backup will be created before replacing the binaries."
+    printf '\n'
+    confirm "Do you want to continue with the update?" "n" || die "Aborted by user."
+}
+
+interactive_migration_summary() {
+    hr
+    printf '\n'
+    box \
+        "Router:          $OPENWRT_TARGET" \
+        "Architecture:    $MACHINE_ARCH -> $TS_ARCH" \
+        "Package manager: $PKG_MANAGER" \
+        "Current layout:  multicall (apk-managed)" \
+        "Target layout:   standalone separate binaries" \
+        "Current version: $CURRENT_VERSION" \
+        "Latest version:  $LATEST_VERSION"
+    printf '\n'
+    ui_warn "This will remove the apk Tailscale package entry."
+    ui_warn "Tailscale connectivity will drop briefly during migration."
+    ui_warn "kmod-tun will be reinstalled if apk removes it."
+    ui_warn "Node identity at /etc/tailscale/ will be preserved."
+    ui_warn "After migration, use this script for future updates."
+    printf '\n'
+
+    # Migration prompt is never bypassed by --yes.
+    # --yes-i-have-lan-access is the explicit confirmation for migration.
+    if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
+        ui_step "Non-interactive migration confirmed by --yes-i-have-lan-access."
+        return 0
+    fi
+
+    while true; do
+        printf "${C_BLUE}> Are you sure you want to continue with the migration? (y/N) ${C_RESET}"
+        read -r ANSWER
+        [ -n "$ANSWER" ] || ANSWER="n"
+        case "$ANSWER" in
+            y|Y|yes|YES) return 0 ;;
+            n|N|no|NO)   die "Migration aborted by user." ;;
+            *) ui_warn "Please answer y or n." ;;
+        esac
+    done
+}
+
+render_dashboard() {
+    # Read POSIX timezone string from UCI (e.g. PST-8 means GMT+8)
+    TZ_POSIX="$(uci get system.@system[0].timezone 2>/dev/null || true)"
+    NOW=""
+
+    # Calculate GMT offset from POSIX string (sign is inverted in POSIX notation)
+    GMT_LABEL="UTC"
+    if [ -n "$TZ_POSIX" ]; then
+        OFFSET="$(echo "$TZ_POSIX" | sed -n 's/^[A-Za-z]*\([+-][0-9]*\).*/\1/p')"
+        if [ -n "$OFFSET" ]; then
+            case "$OFFSET" in
+                -*) GMT_LABEL="GMT+${OFFSET#-}" ;;
+                +*) GMT_LABEL="GMT-${OFFSET#+}" ;;
+                *)  GMT_LABEL="GMT" ;;
+            esac
+        fi
+        NOW="$(TZ="$TZ_POSIX" date "+%a %b %d %Y %I:%M:%S %p $GMT_LABEL" 2>/dev/null || true)"
+    fi
+
+    [ -n "$NOW" ] || NOW="$(date '+%a %b %d %Y %I:%M:%S %p UTC' 2>/dev/null || true)"
+    [ -n "$NOW" ] || NOW="time-unavailable"
+    MODEL="$(cat /tmp/sysinfo/model 2>/dev/null || echo "${OPENWRT_TARGET:-unknown}")"
+    FW_VER="${OPENWRT_RELEASE:-}"
+    if [ -z "$FW_VER" ] && [ -f /etc/openwrt_release ]; then
+        FW_VER="$(. /etc/openwrt_release 2>/dev/null && echo "${DISTRIB_RELEASE:-}")"
+    fi
+    [ -n "$FW_VER" ] || FW_VER="unknown"
+    LAN_IP="$(ip -4 addr show br-lan 2>/dev/null | awk '/inet / {print $2}' | head -n 1)"
+    [ -n "$LAN_IP" ] || LAN_IP="unknown"
+    TS_VER="$(tailscale version 2>/dev/null | awk 'NR==1 {print $1}')"
+    [ -n "$TS_VER" ] || TS_VER="not installed"
+
+    hr
+    printf '\n'
+    printf "  ${UI_TITLE}openwrt-tailscale-updater${C_RESET}\n"
+    printf '\n'
+    printf "  Model:     %s\n" "$MODEL"
+    printf "  Firmware:  OpenWrt %s\n" "$FW_VER"
+    printf "  LAN:       %s\n" "$LAN_IP"
+    printf "  Tailscale: %s\n" "$TS_VER"
+    printf "  Time:      %s\n" "$NOW"
+    printf "  Theme:     %s\n" "$THEME_NAME"
+    printf '\n'
+}
+
+show_about() {
+    BACKUP_COUNT="$(find "$BACKUP_DIR" -maxdepth 1 -name 'tailscale-backup-*.tar.gz' 2>/dev/null | wc -l | tr -d ' ')"
+    TS_VER="$(tailscale version 2>/dev/null | awk 'NR==1 {print $1}')"
+    [ -n "$TS_VER" ] || TS_VER="not installed"
+
+    hr
+    printf '\n'
+    ui_section_bar "About openwrt-tailscale-updater"
+    printf '\n'
+    printf "  Tailscale: %s\n" "$TS_VER"
+    printf "  Theme:     %s\n" "$THEME_NAME"
+    printf "  State:     %s\n" "$STATE_DIR"
+    printf "  Backups:   %s found in %s\n" "$BACKUP_COUNT" "$BACKUP_DIR"
+    printf '\n'
+    [ "$NON_INTERACTIVE" -eq 1 ] && return 0
+    printf "${UI_HINT}> Press Enter to return...${C_RESET}"
+    read -r _DUMMY
+}
+
+reset_menu_defaults() {
+    TRACK="stable"
+    SELECT_RELEASE=0
+    FORCE=0
+    DRY_RUN=0
+    ROLLBACK=0
+    DELETE_BACKUP=0
+    MIGRATE_MULTICALL=0
+    CONFIRMED_LAN=0
+}
+
+show_theme_menu() {
+    while true; do
+        hr
+        printf '\n'
+        ui_section_bar "Theme Picker"
+        printf '\n'
+        ui_menu_item "1" "classic"
+        ui_menu_item "2" "green"
+        ui_menu_item "3" "amber"
+        ui_menu_item "4" "ocean"
+        ui_menu_item "5" "mono (no color)"
+        printf '\n'
+        ui_menu_item "c" "cancel"
+        printf '\n'
+        printf "${C_BLUE}> Select theme [1-5 or c]: ${C_RESET}"
+        read -r CHOICE
+
+        case "$CHOICE" in
+            1) THEME_NAME="classic"; theme_save; theme_apply "$THEME_NAME"; ui_ok "Theme set: classic";    return 0 ;;
+            2) THEME_NAME="green";   theme_save; theme_apply "$THEME_NAME"; ui_ok "Theme set: green";      return 0 ;;
+            3) THEME_NAME="amber";   theme_save; theme_apply "$THEME_NAME"; ui_ok "Theme set: amber";      return 0 ;;
+            4) THEME_NAME="ocean";   theme_save; theme_apply "$THEME_NAME"; ui_ok "Theme set: ocean";      return 0 ;;
+            5) THEME_NAME="mono";    theme_save; theme_apply "$THEME_NAME"; ui_ok "Theme set: mono";       return 0 ;;
+            c|C) return 0 ;;
+            *) ui_warn "Please select 1-5 or c." ;;
+        esac
+    done
+}
+
+show_main_menu() {
+    while true; do
+        render_dashboard
+
+        ui_section_bar "Update"
+        ui_menu_item "1" "Update to latest stable"
+        ui_menu_item "2" "Update to latest unstable" "not for production"
+        ui_menu_item "3" "Update to latest release candidate" "use for testing only"
+        ui_menu_item "4" "Select a specific stable version"
+        printf '\n'
+
+        ui_section_bar "Recovery / Maintenance"
+        ui_menu_item "5" "Rollback to previous version"
+        ui_menu_item "6" "Delete old backups"
+        printf '\n'
+
+        ui_section_bar "Options"
+        ui_menu_item "e" "Exit"
+        ui_menu_item "t" "Theme picker"
+        ui_menu_item "r" "Reset menu defaults"
+        ui_menu_item "a" "About"
+        printf '\n'
+
+        printf "${C_BLUE}> Select [1-6, e, t, r, a]: ${C_RESET}"
+        read -r CHOICE
+
+        case "$CHOICE" in
+            1) TRACK="stable";            return 0 ;;
+            2) TRACK="unstable";          return 0 ;;
+            3) TRACK="release-candidate"; return 0 ;;
+            4) SELECT_RELEASE=1;          return 0 ;;
+            5) ROLLBACK=1;                return 0 ;;
+            6) DELETE_BACKUP=1;           return 0 ;;
+            t|T) show_theme_menu ;;
+            r|R) reset_menu_defaults; ui_ok "Defaults restored." ;;
+            a|A) show_about ;;
+            e|E|c|C) log "Cancelled by user."; exit 0 ;;
+            *) ui_warn "Please select 1-6, e, t, r, or a." ;;
+        esac
+    done
+}
+
+main() {
+    theme_init
+    parse_args "$@"
+
+    # Show main menu when no action flags are passed and running interactively
+    NO_ACTION_FLAGS=1
+    [ "$FORCE" -eq 1 ]              && NO_ACTION_FLAGS=0
+    [ "$DRY_RUN" -eq 1 ]            && NO_ACTION_FLAGS=0
+    [ "$ROLLBACK" -eq 1 ]           && NO_ACTION_FLAGS=0
+    [ "$DELETE_BACKUP" -eq 1 ]      && NO_ACTION_FLAGS=0
+    [ "$SELECT_RELEASE" -eq 1 ]     && NO_ACTION_FLAGS=0
+    [ "$MIGRATE_MULTICALL" -eq 1 ]  && NO_ACTION_FLAGS=0
+    [ "$TRACK" != "stable" ]        && NO_ACTION_FLAGS=0
+
+    if [ "$NO_ACTION_FLAGS" -eq 1 ] && [ "$NON_INTERACTIVE" -eq 0 ] && is_tty; then
+        show_main_menu
+    fi
+
+    # Rollback and delete-backup only need path detection, not full preflight
+    if [ "$ROLLBACK" -eq 1 ] || [ "$DELETE_BACKUP" -eq 1 ]; then
+        read_openwrt_release
+        detect_pkg_manager
+        detect_arch
+        command -v readlink >/dev/null 2>&1 || die "readlink is missing"
+        readlink -f / >/dev/null 2>&1 || die "readlink -f is not supported on this system"
+        detect_tailscale_paths
+        detect_tailscaled_service
+        if [ "$ROLLBACK" -eq 1 ]; then
+            do_rollback
+        else
+            do_delete_backup
+        fi
+        exit 0
+    fi
+
+    preflight
+    current_version
+    interactive_preflight_display
+
+    if [ "$MIGRATE_MULTICALL" -eq 1 ]; then
+        validate_migration_preconditions
+    fi
+
+    find_latest_release
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        hr
+        ui_step "Dry run only. No changes made."
+        box \
+            "Installed version: $CURRENT_VERSION ($CURRENT_TRACK)" \
+            "Target track:      $TRACK" \
+            "Latest version:    $LATEST_VERSION" \
+            "Archive:           $ARCHIVE_NAME" \
+            "tailscale:         $TAILSCALE_REAL" \
+            "tailscaled:        $TAILSCALED_REAL" \
+            "Init script:       $TAILSCALED_INIT"
+        cleanup
+        exit 0
+    fi
+
+    if [ "$CURRENT_VERSION" = "$LATEST_VERSION" ] && [ "$FORCE" -ne 1 ] && [ "$MIGRATE_MULTICALL" -ne 1 ] && [ "$SELECT_RELEASE" -ne 1 ]; then
+        ui_ok "Already on latest version ($CURRENT_VERSION). Use --force to reinstall."
+        cleanup
+        exit 0
+    fi
+
+    if [ "$MIGRATE_MULTICALL" -eq 1 ]; then
+        interactive_migration_summary
+    else
+        interactive_update_summary
+    fi
+
+    backup_current
+    download_release
+    stop_tailscaled
+
+    if [ "$MIGRATE_MULTICALL" -eq 1 ]; then
+        remove_apk_package
+        ensure_kmod_tun
+        ensure_init_compat_symlink
+    fi
+
+    install_binaries
+    start_tailscaled
+    verify_install
+    ensure_sysupgrade_persistence
+    cleanup
+
+    if [ "$MIGRATE_MULTICALL" -eq 1 ]; then
+        hr
+        ui_ok "Migration complete. This router is now running upstream Tailscale $LATEST_VERSION."
+        ui_ok "apk no longer manages Tailscale on this router."
+        ui_step "Use this script for future updates."
+        if apk list --installed 2>/dev/null | grep -qi '^tailscale'; then
+            ui_warn "apk still shows Tailscale as installed. Check manually with: apk list --installed | grep tailscale"
+        else
+            ui_ok "Confirmed: Tailscale is no longer apk-managed on this router."
+        fi
+    else
+        hr
+        ui_ok "Update complete. Tailscale $LATEST_VERSION is now running."
+    fi
+}
+
+main "$@"

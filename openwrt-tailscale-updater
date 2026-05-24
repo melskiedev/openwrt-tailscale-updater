@@ -646,7 +646,7 @@ detect_tailscaled_service() {
 }
 
 preflight() {
-    read_openwrt_release
+    [ -n "${OPENWRT_RELEASE:-}" ] || read_openwrt_release
     detect_pkg_manager
     detect_arch
 
@@ -1245,11 +1245,7 @@ render_dashboard() {
     [ -n "$NOW" ] || NOW="$(date '+%a %b %d %Y %I:%M:%S %p UTC' 2>/dev/null || true)"
     [ -n "$NOW" ] || NOW="time-unavailable"
     MODEL="$(cat /tmp/sysinfo/model 2>/dev/null || echo "${OPENWRT_TARGET:-unknown}")"
-    FW_VER="${OPENWRT_RELEASE:-}"
-    if [ -z "$FW_VER" ] && [ -f /etc/openwrt_release ]; then
-        FW_VER="$(. /etc/openwrt_release 2>/dev/null && echo "${DISTRIB_RELEASE:-}")"
-    fi
-    [ -n "$FW_VER" ] || FW_VER="unknown"
+    FW_VER="${OPENWRT_RELEASE:-unknown}"
     LAN_IP="$(ip -4 addr show br-lan 2>/dev/null | awk '/inet / {print $2}' | head -n 1)"
     [ -n "$LAN_IP" ] || LAN_IP="unknown"
     TS_VER="$(tailscale version 2>/dev/null | awk 'NR==1 {print $1}')"
@@ -1373,6 +1369,11 @@ main() {
     theme_init
     parse_args "$@"
 
+    # Load OpenWrt metadata early so the dashboard has firmware info
+    if [ -f /etc/openwrt_release ]; then
+        read_openwrt_release
+    fi
+
     # Show main menu when no action flags are passed and running interactively
     NO_ACTION_FLAGS=1
     [ "$FORCE" -eq 1 ]              && NO_ACTION_FLAGS=0
@@ -1389,7 +1390,7 @@ main() {
 
     # Rollback and delete-backup only need path detection, not full preflight
     if [ "$ROLLBACK" -eq 1 ] || [ "$DELETE_BACKUP" -eq 1 ]; then
-        read_openwrt_release
+        [ -n "${OPENWRT_RELEASE:-}" ] || read_openwrt_release
         detect_pkg_manager
         detect_arch
         command -v readlink >/dev/null 2>&1 || die "readlink is missing"

@@ -296,7 +296,7 @@ confirm() {
 http_get() {
     URL="$1"
     OUT="$2"
-    if wget -q -O "$OUT" "$URL" 2>/dev/null; then
+    if wget -q -O "$OUT" "$URL" 2>/dev/null && [ -s "$OUT" ]; then
         return 0
     elif command -v curl >/dev/null 2>&1; then
         curl -sL "$URL" -o "$OUT" 2>/dev/null

@@ -20,8 +20,14 @@ By using this script, you acknowledge that you understand the risks and accept f
 
 ## Quick Start
 
+**Using wget** (most OpenWrt routers):
 ```sh
 wget -q https://raw.githubusercontent.com/melskiedev/openwrt-tailscale-updater/main/openwrt-tailscale-updater -O /usr/bin/openwrt-tailscale-updater && chmod +x /usr/bin/openwrt-tailscale-updater && /usr/bin/openwrt-tailscale-updater
+```
+
+**Using curl** (if wget lacks HTTPS support):
+```sh
+curl -sL https://raw.githubusercontent.com/melskiedev/openwrt-tailscale-updater/main/openwrt-tailscale-updater -o /usr/bin/openwrt-tailscale-updater && chmod +x /usr/bin/openwrt-tailscale-updater && /usr/bin/openwrt-tailscale-updater
 ```
 
 > Run manually. Do not add to cron.

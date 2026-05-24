@@ -293,6 +293,18 @@ confirm() {
 }
 
 
+http_get() {
+    URL="$1"
+    OUT="$2"
+    if wget -q -O "$OUT" "$URL" 2>/dev/null; then
+        return 0
+    elif command -v curl >/dev/null 2>&1; then
+        curl -sL "$URL" -o "$OUT" 2>/dev/null
+        return $?
+    fi
+    return 1
+}
+
 log() {
     logger -t "$LOGTAG" "$1" 2>/dev/null || true
     ui_step "$1"
@@ -737,7 +749,7 @@ find_latest_release() {
     rm -rf "$TMP_DIR"
     mkdir -p "$TMP_DIR"
 
-    wget -q -O "$INDEX_FILE" "$PKG_URL_BASE/" || die "Failed to fetch Tailscale package index"
+    http_get "$PKG_URL_BASE/" "$INDEX_FILE" || die "Failed to fetch Tailscale package index"
 
     if [ "$SELECT_RELEASE" -eq 1 ]; then
         if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
@@ -1004,7 +1016,7 @@ do_delete_backup() {
 download_release() {
     log "Downloading: $DOWNLOAD_URL"
 
-    wget -q -O "$TMP_DIR/tailscale.tgz" "$DOWNLOAD_URL" || die "Download failed"
+    http_get "$DOWNLOAD_URL" "$TMP_DIR/tailscale.tgz" || die "Download failed"
 
     log "Extracting archive"
     tar xzf "$TMP_DIR/tailscale.tgz" -C "$TMP_DIR" || die "Extract failed"

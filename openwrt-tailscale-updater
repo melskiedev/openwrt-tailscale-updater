@@ -48,6 +48,8 @@ NON_INTERACTIVE=0
 VERBOSE=0
 SELECT_RELEASE=0
 TRACK="stable"
+GITHUB_LATEST_VERSION="unknown"
+GITHUB_RELEASE_URL="https://api.github.com/repos/tailscale/tailscale/releases/latest"
 
 mkdir -p "$STATE_DIR" "$BACKUP_DIR"
 
@@ -735,6 +737,24 @@ current_version() {
     fi
 }
 
+detect_github_latest_release() {
+    GITHUB_LATEST_VERSION="unknown"
+
+    GITHUB_FILE="$TMP_DIR/github-latest.json"
+    rm -f "$GITHUB_FILE"
+
+    http_get "$GITHUB_RELEASE_URL" "$GITHUB_FILE" || return 0
+    [ -s "$GITHUB_FILE" ] || return 0
+
+    GITHUB_TAG="$(
+        sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' "$GITHUB_FILE" \
+        | head -n 1
+    )"
+
+    [ -n "$GITHUB_TAG" ] || return 0
+    GITHUB_LATEST_VERSION="${GITHUB_TAG#v}"
+}
+
 find_latest_release() {
     PKG_URL_BASE="https://pkgs.tailscale.com/${TRACK}"
     ui_step "Checking latest release from $PKG_URL_BASE"
@@ -751,14 +771,16 @@ find_latest_release() {
 
     http_get "$PKG_URL_BASE/" "$INDEX_FILE" || die "Failed to fetch Tailscale package index"
 
+    detect_github_latest_release
+
     if [ "$SELECT_RELEASE" -eq 1 ]; then
         if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
             die "--select-release requires an interactive terminal."
         fi
-        # Build list of all available versions for this arch
         VERSION_LIST="$(
             grep -o "tailscale_[0-9][^\" ]*_${TS_ARCH}\.tgz" "$INDEX_FILE" \
             | sed -n 's/^tailscale_\([^_]*\)_.*/\1/p' \
+            | sort -u \
             | sort -t. -k1,1rn -k2,2rn -k3,3rn
         )"
 
@@ -810,6 +832,10 @@ find_latest_release() {
     else
         ARCHIVE_NAME="$(
             grep -o "tailscale_[0-9][^\" ]*_${TS_ARCH}\.tgz" "$INDEX_FILE" \
+            | sort -u \
+            | awk -F_ '{print $2, $0}' \
+            | sort -t. -k1,1rn -k2,2rn -k3,3rn \
+            | awk '{print $2}' \
             | head -n 1
         )"
 
@@ -820,9 +846,15 @@ find_latest_release() {
 
         [ -n "$LATEST_VERSION" ] || die "Could not parse latest version from archive name: $ARCHIVE_NAME"
 
-        ui_ok "Current version: $CURRENT_VERSION ($CURRENT_TRACK)"
-        ui_ok "Latest version:  $LATEST_VERSION ($TRACK)"
-        ui_ok "Archive:         $ARCHIVE_NAME"
+        ui_ok "Current version:       $CURRENT_VERSION ($CURRENT_TRACK)"
+        ui_ok "Latest static tarball: $LATEST_VERSION ($TRACK)"
+        ui_ok "GitHub latest release: $GITHUB_LATEST_VERSION"
+        ui_ok "Archive:               $ARCHIVE_NAME"
+
+        if [ "$GITHUB_LATEST_VERSION" != "unknown" ] && [ "$GITHUB_LATEST_VERSION" != "$LATEST_VERSION" ]; then
+            ui_warn "GitHub has $GITHUB_LATEST_VERSION but static $TS_ARCH tarball is not available on $TRACK yet."
+            ui_warn "This updater will install the latest available static tarball: $LATEST_VERSION."
+        fi
     fi
 }
 
@@ -1184,7 +1216,8 @@ interactive_update_summary() {
         "Init script:       $TAILSCALED_INIT" \
         "Installed version: $CURRENT_VERSION ($CURRENT_TRACK)" \
         "Target track:      $TRACK" \
-        "Latest version:    $LATEST_VERSION"
+        "Static tarball:    $LATEST_VERSION" \
+        "GitHub latest:     $GITHUB_LATEST_VERSION"
     printf '\n'
     if [ "$TRACK" = "unstable" ]; then
         ui_warn "You selected the UNSTABLE track. Not recommended for production routers."
@@ -1433,7 +1466,8 @@ main() {
         box \
             "Installed version: $CURRENT_VERSION ($CURRENT_TRACK)" \
             "Target track:      $TRACK" \
-            "Latest version:    $LATEST_VERSION" \
+            "Static tarball:    $LATEST_VERSION" \
+            "GitHub latest:     $GITHUB_LATEST_VERSION" \
             "Archive:           $ARCHIVE_NAME" \
             "tailscale:         $TAILSCALE_REAL" \
             "tailscaled:        $TAILSCALED_REAL" \

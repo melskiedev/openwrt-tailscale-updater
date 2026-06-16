@@ -63,6 +63,8 @@ curl -sL https://raw.githubusercontent.com/melskiedev/openwrt-tailscale-updater/
 | `--yes` / `-y` | Skip all confirmation prompts, run unattended |
 | `--non-interactive` | Disable all prompts, use defaults, for scripted use |
 | `--verbose` | Show detailed detection and operation logs |
+| `--theme NAME` | Set menu theme: `classic`, `green`, `amber`, `ocean`, or `mono` |
+| `--reset-theme` | Reset saved menu theme to `classic` |
 | `--unstable` | Use the unstable track (odd minor versions, e.g. 1.97.x). Not for production. |
 | `--release-candidate` | Use the release-candidate track. Use only for testing. |
 | `--select-release` | List available releases from the active track and choose a specific version |
@@ -196,6 +198,18 @@ Migration mode converts an apk-managed multicall Tailscale install to standalone
 ```
 
 After migration, use this updater for all future Tailscale updates. Do not use `apk upgrade tailscale`.
+
+---
+
+## GitHub Latest vs Static Tarball
+
+This updater checks GitHub releases for visibility only.
+
+Installation always uses the latest verified static tarball available from `pkgs.tailscale.com/<track>/` for the detected CPU architecture.
+
+If GitHub shows a newer version but the static tarball is not yet available, the updater warns and installs only the latest available static tarball.
+
+Downloaded tarballs are verified against the matching `.sha256` checksum from the Tailscale package server before extraction.
 
 ---
 

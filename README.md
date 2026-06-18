@@ -1,6 +1,6 @@
 # openwrt-tailscale-updater
 
-A vanilla OpenWrt Tailscale **updater** for routers that already have Tailscale installed. It does not install Tailscale on a blank router; use the package manager first (see [First-Time Install](#first-time-install)).
+A vanilla OpenWrt Tailscale **updater** for routers with Tailscale already installed. On a router with no Tailscale yet, running the script from SSH shows a first-run install menu (package install and upstream binary install are rolling out in v1.4.0).
 
 No vendor-specific logic. No UPX. No tiny binaries. It detects `apk` or `opkg`, resolves the active Tailscale binary and init paths, protects multicall installs, and can migrate apk-managed multicall layouts to standalone upstream binaries when explicitly requested.
 
@@ -37,7 +37,7 @@ curl -sL https://raw.githubusercontent.com/melskiedev/openwrt-tailscale-updater/
 ## Requirements
 
 - Vanilla OpenWrt (any version)
-- Tailscale already installed (see [First-Time Install](#first-time-install) for a fresh router)
+- Tailscale installed for update mode (see [First-Time Install](#first-time-install) if nothing is installed yet)
 - At least 60 MB free on `/tmp`
 - `wget` or `curl` for downloads (the script installs `wget` if missing, then tries `curl`)
 - `sha256sum` for checksum verification (`coreutils-sha256sum` on OpenWrt if not present)
@@ -49,9 +49,23 @@ The script must use Unix line endings (LF). If you copy it from Windows and `sh 
 
 ## First-Time Install
 
-This script is an **updater**. It expects `tailscale`, `tailscaled`, and an OpenWrt init script to already exist. It does not perform a greenfield install yet.
+If Tailscale is not installed, run the script from SSH with no flags:
 
-On a fresh router with no Tailscale, install through the OpenWrt package manager first:
+```sh
+/usr/bin/openwrt-tailscale-updater
+```
+
+You will see a first-run menu:
+
+| Option | Description |
+|---|---|
+| **1** | Install via OpenWrt package manager (recommended; full automation in v1.4.0-rc1) |
+| **2** | Install upstream static binaries (v1.4.0-rc2) |
+| **e** | Exit |
+
+Until v1.4.0-rc1/rc2 ship, option 1 prints the manual package-manager commands. Option 2 is not available yet.
+
+**Manual package install** (works today):
 
 ```sh
 # OpenWrt 25.12+
@@ -61,27 +75,27 @@ apk update && apk add tailscale
 opkg update && opkg install tailscale
 ```
 
-Then authenticate and configure Tailscale as you normally would (`tailscale up`, etc.).
-
-Verify the updater sees your install:
+Then run `tailscale up`, and verify the updater sees your install:
 
 ```sh
 /usr/bin/openwrt-tailscale-updater --dry-run
 ```
 
-If the package install uses a multicall layout (both binaries resolve to one file), the updater will detect it and offer migration to standalone upstream binaries. See [Migration Mode](#migration-mode).
+If the package install uses a multicall layout (both binaries resolve to one file), the updater detects it and offers migration to standalone upstream binaries. See [Migration Mode](#migration-mode).
+
+**Partial or broken installs** (some pieces missing) are refused. The script prints what is missing and suggests `apk fix tailscale` or `opkg install tailscale`. It does not auto-repair.
 
 ---
 
 ## Menu
 
-Run with no arguments from SSH to open the menu:
+Run with no arguments from SSH:
 
 ```sh
 /usr/bin/openwrt-tailscale-updater
 ```
 
-The dashboard shows router info, installed Tailscale version, latest stable / release-candidate / unstable versions (fetched from `pkgs.tailscale.com`, cached for 5 minutes under `/root/tailscale-updater/version-cache-*`), and the active theme.
+**If Tailscale is installed**, you get the updater menu. The dashboard shows router info, installed version, latest stable / release-candidate / unstable versions (fetched from `pkgs.tailscale.com`, cached for 5 minutes under `/root/tailscale-updater/version-cache-*`), and the active theme.
 
 | Section | Options |
 |---|---|
@@ -89,7 +103,9 @@ The dashboard shows router info, installed Tailscale version, latest stable / re
 | Recovery / Maintenance | rollback, delete old backups |
 | Options | theme picker (`t`), reset defaults (`r`), about (`a`), exit (`e`) |
 
-`--theme NAME` and `--reset-theme` set the theme and exit. They do not run an update. Use menu option `t` to change theme from the menu.
+**If Tailscale is not installed**, you get the first-run install menu instead. See [First-Time Install](#first-time-install).
+
+`--theme NAME` and `--reset-theme` set the theme and exit. They do not run an update. Use menu option `t` to change theme from the updater menu.
 
 ---
 
@@ -106,7 +122,7 @@ The dashboard shows router info, installed Tailscale version, latest stable / re
 
 | Argument | Description |
 |---|---|
-| *(none)* | Show menu |
+| *(none)* | Show menu (updater menu if installed, first-run install menu if not) |
 | `--force` | Reinstall even if already on latest version |
 | `--dry-run` | Show detected values and latest version without making changes |
 | `--keep-tmp` | Keep downloaded files in `/tmp/tailscale-update` after install |
@@ -184,6 +200,7 @@ The dashboard shows router info, installed Tailscale version, latest stable / re
 
 ## What It Does
 
+- Detects install state: complete, empty, multicall, or partial (refuses partial installs)
 - Detects CPU architecture and maps to the correct Tailscale tarball
 - Detects package manager (`apk` or `opkg`) by available command
 - Detects Tailscale binary paths dynamically, supports `/usr/sbin` and `/usr/bin` layouts

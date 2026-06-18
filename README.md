@@ -322,7 +322,11 @@ The rollback menu lists available backups with version and timestamp:
 Select backup to restore [1-2]:
 ```
 
-Rollback restores only the `tailscale` and `tailscaled` binaries. Node identity at `/etc/tailscale/` is not touched.
+Rollback restores the `tailscale` and `tailscaled` binaries using paths recorded in the backup. Node identity at `/etc/tailscale/` is not touched.
+
+Backups created by v1.4.0-rc1 and later include `.tailscale-backup-meta` inside the tarball (binary paths, init script, version, multicall flag). A readable copy is also written beside the archive as `tailscale-backup-<version>-<timestamp>.tar.gz.meta`.
+
+Older backups without metadata still work: rollback falls back to the currently detected paths and prints a warning. That fallback may fail if the router layout changed since the backup was created (for example, before or after multicall migration).
 
 ---
 
@@ -344,9 +348,12 @@ Each run creates a timestamped backup before making any changes:
 
 ```
 /root/tailscale-updater/backups/tailscale-backup-<version>-YYYYMMDD-HHMMSS.tar.gz
+/root/tailscale-updater/backups/tailscale-backup-<version>-YYYYMMDD-HHMMSS.tar.gz.meta
 ```
 
-Includes current binaries, init script, and `/etc/tailscale/`.
+Includes current binaries, init script, `/etc/tailscale/`, and `.tailscale-backup-meta` inside the archive. The `.meta` sidecar is a human-readable copy of the metadata for inspection without extracting the tarball.
+
+Tar warnings (if any) are written to `/root/tailscale-updater/backup-<timestamp>.log` instead of being discarded.
 
 State and cache files live under `/root/tailscale-updater/` (`backups/`, `theme.conf`, `version-cache-*`).
 

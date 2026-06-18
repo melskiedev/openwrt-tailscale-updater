@@ -310,7 +310,7 @@ http_get() {
     rm -f "$OUT"
 
     if command -v wget >/dev/null 2>&1; then
-        if wget -q -O "$OUT" "$URL" 2>/dev/null && [ -s "$OUT" ]; then
+        if wget -T 60 -q -O "$OUT" "$URL" 2>/dev/null && [ -s "$OUT" ]; then
             return 0
         fi
     fi
@@ -318,7 +318,7 @@ http_get() {
     rm -f "$OUT"
 
     if command -v curl >/dev/null 2>&1; then
-        if curl -fsSL "$URL" -o "$OUT" 2>/dev/null && [ -s "$OUT" ]; then
+        if curl -fsSL --connect-timeout 15 --max-time 60 "$URL" -o "$OUT" 2>/dev/null && [ -s "$OUT" ]; then
             return 0
         fi
     fi
@@ -988,6 +988,10 @@ current_version() {
     fi
 }
 
+# Parse latest version from pkgs.tailscale.com HTML index pages.
+# Verify format at: https://pkgs.tailscale.com/stable/?arch=ARCH
+# Expected tarball filename: tailscale_VERSION_ARCH.tgz
+# Example: tailscale_1.98.4_arm64.tgz
 parse_latest_version_from_index() {
     INDEX_FILE="$1"
 
@@ -1086,7 +1090,11 @@ refresh_menu_versions() {
 menu_track_hint() {
     LATEST="$1"
     EXTRA="${2:-}"
-    INSTALLED="$(tailscale version 2>/dev/null | awk 'NR==1 {print $1}')"
+    if [ -n "${TAILSCALE_BIN:-}" ] && [ -x "$TAILSCALE_BIN" ]; then
+        INSTALLED="$("$TAILSCALE_BIN" version 2>/dev/null | awk 'NR==1 {print $1}')"
+    else
+        INSTALLED="$(tailscale version 2>/dev/null | awk 'NR==1 {print $1}')"
+    fi
     HINT=""
 
     if [ -n "$LATEST" ] && [ "$LATEST" != "unknown" ]; then
@@ -1219,20 +1227,79 @@ find_latest_release() {
     fi
 }
 
+read_meta_value() {
+    META="$1"
+    KEY="$2"
+    grep "^${KEY}=" "$META" 2>/dev/null | head -n 1 | sed "s/^${KEY}=//"
+}
+
+write_backup_meta() {
+    DEST="$1"
+    CREATED_AT="$2"
+
+    cat >"$DEST" <<EOF
+tailscale_real=$TAILSCALE_REAL
+tailscaled_real=$TAILSCALED_REAL
+tailscale_bin=$TAILSCALE_BIN
+tailscaled_bin=$TAILSCALED_BIN
+init=$TAILSCALED_INIT
+version=$CURRENT_VERSION
+multicall=$MULTICALL_LAYOUT
+created_at=$CREATED_AT
+EOF
+}
+
+backup_add_member() {
+    MEMBER="$1"
+    EXISTING="$2"
+
+    if [ ! -e "$MEMBER" ]; then
+        printf '%s' "$EXISTING"
+        return 0
+    fi
+    for M in $EXISTING; do
+        if [ "$M" = "$MEMBER" ]; then
+            printf '%s' "$EXISTING"
+            return 0
+        fi
+    done
+    printf '%s' "$EXISTING $MEMBER"
+}
+
 backup_current() {
     TS="$(date +%Y%m%d-%H%M%S)"
     BACKUP_FILE="$BACKUP_DIR/tailscale-backup-${CURRENT_VERSION}-$TS.tar.gz"
+    BACKUP_META_SIDE="${BACKUP_FILE}.meta"
+    BACKUP_LOG="$STATE_DIR/backup-$TS.log"
+    META_STAGING="$TMP_DIR/backup-meta-staging"
 
     log "Creating backup: $BACKUP_FILE"
 
+    rm -rf "$META_STAGING"
+    mkdir -p "$META_STAGING"
+    META_FILE="$META_STAGING/.tailscale-backup-meta"
+    write_backup_meta "$META_FILE" "$TS"
+    cp "$META_FILE" "$BACKUP_META_SIDE" || die "Failed to write backup metadata sidecar"
+
+    BACKUP_MEMBERS=""
+    BACKUP_MEMBERS="$(backup_add_member "$TAILSCALE_BIN" "$BACKUP_MEMBERS")"
+    BACKUP_MEMBERS="$(backup_add_member "$TAILSCALED_BIN" "$BACKUP_MEMBERS")"
+    BACKUP_MEMBERS="$(backup_add_member "$TAILSCALE_REAL" "$BACKUP_MEMBERS")"
+    BACKUP_MEMBERS="$(backup_add_member "$TAILSCALED_REAL" "$BACKUP_MEMBERS")"
+    BACKUP_MEMBERS="$(backup_add_member "$TAILSCALED_INIT" "$BACKUP_MEMBERS")"
+    BACKUP_MEMBERS="$(backup_add_member /etc/tailscale "$BACKUP_MEMBERS")"
+
+    # BACKUP_MEMBERS is word-split intentionally; paths are fixed OpenWrt locations.
+    # shellcheck disable=SC2086
     tar czf "$BACKUP_FILE" \
-        "$TAILSCALE_BIN" \
-        "$TAILSCALED_BIN" \
-        "$TAILSCALE_REAL" \
-        "$TAILSCALED_REAL" \
-        "$TAILSCALED_INIT" \
-        /etc/tailscale \
-        2>/dev/null || die "Backup failed"
+        -C "$META_STAGING" .tailscale-backup-meta \
+        $BACKUP_MEMBERS \
+        2>"$BACKUP_LOG" || die "Backup failed. See $BACKUP_LOG"
+
+    if [ -s "$BACKUP_LOG" ]; then
+        ui_warn "Backup completed with warnings. See $BACKUP_LOG"
+        log "Backup completed with warnings: $BACKUP_LOG"
+    fi
 
     log "Backup complete: $BACKUP_FILE"
 }
@@ -1330,9 +1397,28 @@ do_rollback() {
 
     tar xzf "$SELECTED_BACKUP" -C "$ROLLBACK_TMP" || die "Failed to extract backup"
 
+    META_FILE="$ROLLBACK_TMP/.tailscale-backup-meta"
+    if [ -f "$META_FILE" ]; then
+        RESTORE_TAILSCALE_REAL="$(read_meta_value "$META_FILE" tailscale_real)"
+        RESTORE_TAILSCALED_REAL="$(read_meta_value "$META_FILE" tailscaled_real)"
+        RESTORE_INIT="$(read_meta_value "$META_FILE" init)"
+        log "Using backup metadata (version $(read_meta_value "$META_FILE" version))"
+    else
+        ui_warn "No metadata found for this backup. Using current detected paths."
+        ui_warn "Rollback may fail if layout changed since this backup was created."
+        logger -t "$LOGTAG" "WARNING: backup has no metadata; using current detected paths" 2>/dev/null || true
+        RESTORE_TAILSCALE_REAL="$TAILSCALE_REAL"
+        RESTORE_TAILSCALED_REAL="$TAILSCALED_REAL"
+        RESTORE_INIT="$TAILSCALED_INIT"
+    fi
+
+    [ -n "$RESTORE_TAILSCALE_REAL" ]  || die "Backup metadata missing tailscale_real"
+    [ -n "$RESTORE_TAILSCALED_REAL" ] || die "Backup metadata missing tailscaled_real"
+    [ -n "$RESTORE_INIT" ]            || RESTORE_INIT="$TAILSCALED_INIT"
+
     # Stop daemon before restoring
     log "Stopping tailscaled"
-    "$TAILSCALED_INIT" stop 2>/dev/null || true
+    "$RESTORE_INIT" stop 2>/dev/null || true
     sleep 3
     if pidof tailscaled >/dev/null 2>&1; then
         killall tailscaled 2>/dev/null || true
@@ -1340,27 +1426,28 @@ do_rollback() {
     fi
 
     # Restore binaries from backup
-    ROLLBACK_TAILSCALE="${ROLLBACK_TMP}${TAILSCALE_REAL}"
-    ROLLBACK_TAILSCALED="${ROLLBACK_TMP}${TAILSCALED_REAL}"
+    ROLLBACK_TAILSCALE="${ROLLBACK_TMP}${RESTORE_TAILSCALE_REAL}"
+    ROLLBACK_TAILSCALED="${ROLLBACK_TMP}${RESTORE_TAILSCALED_REAL}"
 
-    [ -f "$ROLLBACK_TAILSCALE" ]  || die "tailscale binary not found in backup"
-    [ -f "$ROLLBACK_TAILSCALED" ] || die "tailscaled binary not found in backup"
+    [ -f "$ROLLBACK_TAILSCALE" ]  || die "tailscale binary not found in backup at $RESTORE_TAILSCALE_REAL"
+    [ -f "$ROLLBACK_TAILSCALED" ] || die "tailscaled binary not found in backup at $RESTORE_TAILSCALED_REAL"
 
-    install_binary_safe "$ROLLBACK_TAILSCALE"  "$TAILSCALE_REAL"
-    install_binary_safe "$ROLLBACK_TAILSCALED" "$TAILSCALED_REAL"
+    install_binary_safe "$ROLLBACK_TAILSCALE"  "$RESTORE_TAILSCALE_REAL"
+    install_binary_safe "$ROLLBACK_TAILSCALED" "$RESTORE_TAILSCALED_REAL"
 
     log "Binaries restored"
-    "$TAILSCALE_REAL" version || die "Restored tailscale binary failed to run"
+    "$RESTORE_TAILSCALE_REAL" version || die "Restored tailscale binary failed to run"
 
     # Restart
-    "$TAILSCALED_INIT" enable 2>/dev/null || true
-    "$TAILSCALED_INIT" start || die "Failed to start tailscaled after rollback"
+    "$RESTORE_INIT" enable 2>/dev/null || true
+    "$RESTORE_INIT" start || die "Failed to start tailscaled after rollback"
     sleep 8
     pidof tailscaled >/dev/null 2>&1 || die "tailscaled did not start after rollback"
 
-    log "Rollback complete. Running version: $("$TAILSCALE_REAL" version 2>/dev/null | awk 'NR==1 {print $1}')"
+    log "Rollback complete. Running version: $("$RESTORE_TAILSCALE_REAL" version 2>/dev/null | awk 'NR==1 {print $1}')"
 
     rm -rf "$ROLLBACK_TMP"
+    ROLLBACK_TMP=""
 }
 
 do_delete_backup() {
@@ -1571,6 +1658,7 @@ cleanup() {
     else
         [ -n "${TMP_DIR:-}" ] && rm -rf "$TMP_DIR" 2>/dev/null || true
     fi
+    [ -n "${ROLLBACK_TMP:-}" ] && rm -rf "$ROLLBACK_TMP" 2>/dev/null || true
 }
 
 show_preflight_summary() {
@@ -1928,6 +2016,7 @@ main() {
 
     if [ "$CURRENT_VERSION" = "$LATEST_VERSION" ] && [ "$FORCE" -ne 1 ] && [ "$MIGRATE_MULTICALL" -ne 1 ] && [ "$SELECT_RELEASE" -ne 1 ]; then
         ui_ok "Already on latest version ($CURRENT_VERSION). Use --force to reinstall."
+        logger -t "$LOGTAG" "Already on latest version ($CURRENT_VERSION). Use --force to reinstall." 2>/dev/null || true
         cleanup
         exit 0
     fi

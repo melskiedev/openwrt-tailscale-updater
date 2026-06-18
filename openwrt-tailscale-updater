@@ -44,10 +44,13 @@ CONFIRMED_LAN=0
 ROLLBACK=0
 DELETE_BACKUP=0
 ASSUME_YES=0
-NON_INTERACTIVE=0
 VERBOSE=0
 SELECT_RELEASE=0
+THEME_ONLY=0
 TRACK="stable"
+MENU_LATEST_STABLE="unknown"
+MENU_LATEST_UNSTABLE="unknown"
+MENU_LATEST_RC="unknown"
 GITHUB_LATEST_VERSION="unknown"
 GITHUB_RELEASE_URL="https://api.github.com/repos/tailscale/tailscale/releases/latest"
 
@@ -56,8 +59,6 @@ mkdir -p "$STATE_DIR" "$BACKUP_DIR"
 LOCK_FILE="/tmp/openwrt-tailscale-updater.lock"
 
 
-# ---------------------------------------------------------------
-# UI helpers
 # ---------------------------------------------------------------
 # Theme system
 # ---------------------------------------------------------------
@@ -274,9 +275,8 @@ confirm() {
         return 0
     fi
 
-    if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
-        [ "$DEFAULT" = "y" ] && return 0
-        return 1
+    if ! is_tty; then
+        die "Not running in a terminal. Use --yes to proceed without prompts."
     fi
 
     if [ "$DEFAULT" = "y" ]; then
@@ -388,8 +388,7 @@ Options:
   --force                                    Reinstall even if latest version appears installed
   --dry-run                                  Show detected values and latest version, but do not install
   --keep-tmp                                 Keep downloaded files in /tmp/tailscale-update
-  --yes|-y                                   Skip all confirmation prompts
-  --non-interactive                          Disable all prompts, use defaults
+  --yes|-y                                   Skip confirmation prompts
   --verbose                                  Show detailed detection and operation logs
   --theme NAME                               Set theme: classic, green, amber, ocean, mono
   --reset-theme                              Reset saved theme to classic
@@ -460,9 +459,6 @@ parse_args() {
             --yes|-y)
                 ASSUME_YES=1
                 ;;
-            --non-interactive)
-                NON_INTERACTIVE=1
-                ;;
             --rollback)
                 ROLLBACK=1
                 ;;
@@ -477,6 +473,7 @@ parse_args() {
                     THEME_NAME="$THEME_REQUESTED"
                     theme_save
                     theme_apply "$THEME_REQUESTED"
+                    THEME_ONLY=1
                     ui_ok "Theme set: $THEME_REQUESTED"
                 else
                     die "Unknown theme: $THEME_REQUESTED. Valid themes: classic, green, amber, ocean, mono"
@@ -486,6 +483,7 @@ parse_args() {
                 THEME_NAME="classic"
                 theme_save
                 theme_apply "classic"
+                THEME_ONLY=1
                 ui_ok "Theme reset to classic."
                 ;;
             --help|-h)
@@ -543,8 +541,20 @@ install_pkg_if_missing() {
     log "Missing dependency: $BIN_NAME"
     log "Installing package: $PKG_NAME"
 
+    # PKG_UPDATE / PKG_INSTALL are word-split intentionally (e.g. "apk update").
     $PKG_UPDATE || die "$PKG_MANAGER update failed"
     $PKG_INSTALL "$PKG_NAME" || die "$PKG_MANAGER install failed for $PKG_NAME"
+}
+
+ensure_http_client() {
+    if command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1; then
+        return 0
+    fi
+
+    install_pkg_if_missing wget wget
+    command -v wget >/dev/null 2>&1 || install_pkg_if_missing curl curl
+    command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1 || \
+        die "No HTTP client available. Install wget or curl."
 }
 
 detect_arch() {
@@ -592,7 +602,7 @@ detect_arch() {
 }
 
 handle_multicall_choice() {
-    if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
+    if ! is_tty; then
         log "Detected multicall Tailscale layout:"
         log "  $TAILSCALE_BIN -> $TAILSCALE_REAL"
         log "  $TAILSCALED_BIN -> $TAILSCALED_REAL"
@@ -603,8 +613,10 @@ handle_multicall_choice() {
         else
             log "  opkg update && opkg upgrade tailscale"
         fi
-        log "To convert this router to standalone upstream binaries, run:"
-        log "  $0 --migrate-from-apk-multicall --yes-i-have-lan-access"
+        if [ "${PKG_MANAGER:-}" = "apk" ]; then
+            log "To convert this router to standalone upstream binaries, run:"
+            log "  $0 --migrate-from-apk-multicall --yes-i-have-lan-access"
+        fi
         die "Refusing to overwrite multicall layout."
     fi
 
@@ -619,17 +631,26 @@ handle_multicall_choice() {
     else
         printf "      Run: opkg update && opkg upgrade tailscale\n"
     fi
-    printf '\n'
-    printf "  ${C_BOLD}[2]${C_RESET} Migrate to standalone upstream binaries\n"
-    printf "      Removes the package manager's Tailscale ownership.\n"
-    printf "      Tailscale will drop briefly during migration.\n"
-    printf "      Use only with physical or LAN access.\n"
+    if [ "${PKG_MANAGER:-}" = "apk" ]; then
+        printf '\n'
+        printf "  ${C_BOLD}[2]${C_RESET} Migrate to standalone upstream binaries (apk only)\n"
+        printf "      Removes the apk Tailscale package entry.\n"
+        printf "      Tailscale will drop briefly during migration.\n"
+        printf "      Use only with physical or LAN access.\n"
+    fi
     printf '\n'
     printf "  ${C_DIM}[c] Cancel${C_RESET}\n"
     printf '\n'
 
     while true; do
-        printf "${C_BLUE}> Select [1, 2, or c]: ${C_RESET}"
+        if [ "${PKG_MANAGER:-}" = "apk" ]; then
+            PROMPT="Select [1, 2, or c]"
+            INVALID_MSG="Please select 1, 2, or c."
+        else
+            PROMPT="Select [1 or c]"
+            INVALID_MSG="Please select 1 or c."
+        fi
+        printf "${C_BLUE}> %s: ${C_RESET}" "$PROMPT"
         read -r CHOICE
         case "$CHOICE" in
             1)
@@ -642,6 +663,10 @@ handle_multicall_choice() {
                 exit 0
                 ;;
             2)
+                [ "${PKG_MANAGER:-}" = "apk" ] || {
+                    ui_warn "$INVALID_MSG"
+                    continue
+                }
                 printf '\n'
                 printf "${C_BLUE}> Confirm you have physical or LAN access to this router (type YES): ${C_RESET}"
                 read -r CONFIRM_ACCESS
@@ -655,7 +680,7 @@ handle_multicall_choice() {
                 exit 0
                 ;;
             *)
-                ui_warn "Please select 1, 2, or c."
+                ui_warn "$INVALID_MSG"
                 ;;
         esac
     done
@@ -724,7 +749,7 @@ preflight() {
     detect_tailscale_paths
     detect_tailscaled_service
 
-    install_pkg_if_missing wget wget
+    ensure_http_client
     install_pkg_if_missing tar tar
     install_pkg_if_missing gzip gzip
     install_pkg_if_missing sha256sum coreutils-sha256sum
@@ -792,6 +817,126 @@ current_version() {
     fi
 }
 
+parse_latest_version_from_index() {
+    INDEX_FILE="$1"
+
+    ARCHIVE_NAME="$(
+        grep -o "tailscale_[0-9][^\" ]*_${TS_ARCH}\.tgz" "$INDEX_FILE" \
+        | sort -u \
+        | awk -F_ '{print $2, $0}' \
+        | sort -t. -k1,1rn -k2,2rn -k3,3rn \
+        | awk '{print $2}' \
+        | head -n 1
+    )"
+
+    [ -n "$ARCHIVE_NAME" ] || return 1
+    echo "$ARCHIVE_NAME" | sed -n 's/^tailscale_\([^_]*\)_.*/\1/p'
+}
+
+safe_detect_for_menu() {
+    if [ -f /etc/openwrt_release ]; then
+        [ -n "${OPENWRT_RELEASE:-}" ] || read_openwrt_release
+    fi
+    [ -n "${TS_ARCH:-}" ] || detect_arch
+}
+
+fetch_track_latest_version() {
+    TRACK_NAME="$1"
+    CACHE_FILE="$STATE_DIR/version-cache-${TRACK_NAME}"
+    CACHE_MAX_AGE=300
+
+    if [ -f "$CACHE_FILE" ]; then
+        CACHE_MTIME="$(date -r "$CACHE_FILE" +%s 2>/dev/null || echo 0)"
+        NOW_TS="$(date +%s)"
+        if [ "$CACHE_MTIME" -gt 0 ] && [ $((NOW_TS - CACHE_MTIME)) -lt "$CACHE_MAX_AGE" ]; then
+            cat "$CACHE_FILE"
+            return 0
+        fi
+    fi
+
+    command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1 || {
+        [ -f "$CACHE_FILE" ] && cat "$CACHE_FILE"
+        echo "unknown"
+        return 1
+    }
+
+    FETCH_TMP="$STATE_DIR/menu-fetch"
+    mkdir -p "$FETCH_TMP"
+    INDEX_FILE="$FETCH_TMP/index-${TRACK_NAME}.html"
+    rm -f "$INDEX_FILE"
+
+    http_get "https://pkgs.tailscale.com/${TRACK_NAME}/" "$INDEX_FILE" || {
+        [ -f "$CACHE_FILE" ] && cat "$CACHE_FILE"
+        echo "unknown"
+        return 1
+    }
+
+    VER="$(parse_latest_version_from_index "$INDEX_FILE" || echo "")"
+    [ -n "$VER" ] || VER="unknown"
+    if [ "$VER" != "unknown" ]; then
+        printf '%s' "$VER" > "$CACHE_FILE"
+    fi
+    printf '%s' "$VER"
+}
+
+refresh_menu_versions() {
+    MENU_LATEST_STABLE="unknown"
+    MENU_LATEST_UNSTABLE="unknown"
+    MENU_LATEST_RC="unknown"
+    CACHE_MAX_AGE=300
+
+    safe_detect_for_menu
+    command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1 || return 0
+
+    NEED_FETCH=0
+    for t in stable unstable release-candidate; do
+        CACHE_FILE="$STATE_DIR/version-cache-${t}"
+        if [ ! -f "$CACHE_FILE" ]; then
+            NEED_FETCH=1
+            break
+        fi
+        CACHE_MTIME="$(date -r "$CACHE_FILE" +%s 2>/dev/null || echo 0)"
+        NOW_TS="$(date +%s)"
+        if [ "$CACHE_MTIME" -eq 0 ] || [ $((NOW_TS - CACHE_MTIME)) -ge "$CACHE_MAX_AGE" ]; then
+            NEED_FETCH=1
+            break
+        fi
+    done
+
+    if [ "$NEED_FETCH" -eq 1 ]; then
+        ui_step "Checking latest versions..."
+    fi
+
+    MENU_LATEST_STABLE="$(fetch_track_latest_version stable)"
+    MENU_LATEST_UNSTABLE="$(fetch_track_latest_version unstable)"
+    MENU_LATEST_RC="$(fetch_track_latest_version release-candidate)"
+}
+
+menu_track_hint() {
+    LATEST="$1"
+    EXTRA="${2:-}"
+    INSTALLED="$(tailscale version 2>/dev/null | awk 'NR==1 {print $1}')"
+    HINT=""
+
+    if [ -n "$LATEST" ] && [ "$LATEST" != "unknown" ]; then
+        if [ -n "$INSTALLED" ] && [ "$INSTALLED" = "$LATEST" ]; then
+            HINT="latest: ${LATEST}"
+        else
+            HINT="available: ${LATEST}"
+        fi
+    fi
+
+    if [ -n "$EXTRA" ]; then
+        if [ -n "$HINT" ]; then
+            HINT="${HINT}, ${EXTRA}"
+        else
+            HINT="$EXTRA"
+        fi
+    fi
+
+    printf '%s' "$HINT"
+}
+
 detect_github_latest_release() {
     GITHUB_LATEST_VERSION="unknown"
 
@@ -829,8 +974,8 @@ find_latest_release() {
     detect_github_latest_release
 
     if [ "$SELECT_RELEASE" -eq 1 ]; then
-        if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
-            die "--select-release requires an interactive terminal."
+        if ! is_tty; then
+            die "Not running in a terminal. Run from SSH to pick a release."
         fi
         VERSION_LIST="$(
             grep -o "tailscale_[0-9][^\" ]*_${TS_ARCH}\.tgz" "$INDEX_FILE" \
@@ -885,21 +1030,11 @@ find_latest_release() {
 
         ui_ok "Selected version: $LATEST_VERSION"
     else
-        ARCHIVE_NAME="$(
-            grep -o "tailscale_[0-9][^\" ]*_${TS_ARCH}\.tgz" "$INDEX_FILE" \
-            | sort -u \
-            | awk -F_ '{print $2, $0}' \
-            | sort -t. -k1,1rn -k2,2rn -k3,3rn \
-            | awk '{print $2}' \
-            | head -n 1
-        )"
+        LATEST_VERSION="$(parse_latest_version_from_index "$INDEX_FILE")"
+        [ -n "$LATEST_VERSION" ] || die "Could not find Tailscale archive for arch: $TS_ARCH"
 
-        [ -n "$ARCHIVE_NAME" ] || die "Could not find Tailscale archive for arch: $TS_ARCH"
-
-        LATEST_VERSION="$(echo "$ARCHIVE_NAME" | sed -n 's/^tailscale_\([^_]*\)_.*/\1/p')"
+        ARCHIVE_NAME="tailscale_${LATEST_VERSION}_${TS_ARCH}.tgz"
         DOWNLOAD_URL="$PKG_URL_BASE/$ARCHIVE_NAME"
-
-        [ -n "$LATEST_VERSION" ] || die "Could not parse latest version from archive name: $ARCHIVE_NAME"
 
         ui_ok "Current version:       $CURRENT_VERSION ($CURRENT_TRACK)"
         ui_ok "Latest static tarball: $LATEST_VERSION ($TRACK)"
@@ -931,33 +1066,68 @@ backup_current() {
     log "Backup complete: $BACKUP_FILE"
 }
 
+parse_backup_filename() {
+    FNAME="$1"
+    BACKUP_VER="$(echo "$FNAME" | sed -n 's/^tailscale-backup-\([0-9][^-]*\.[^-]*\.[^-]*\)-.*/\1/p')"
+    BACKUP_TS="$(echo "$FNAME" | sed -n 's/^tailscale-backup-[0-9][^-]*\.[^-]*\.[^-]*-\(.*\)\.tar\.gz$/\1/p')"
+    if [ -z "$BACKUP_VER" ]; then
+        BACKUP_VER="unknown"
+        BACKUP_TS="$(echo "$FNAME" | sed -n 's/^tailscale-backup-\(.*\)\.tar\.gz$/\1/p')"
+    fi
+}
+
+list_backups() {
+    BACKUP_LIST="$(find "$BACKUP_DIR" -maxdepth 1 -name 'tailscale-backup-*.tar.gz' | sort -r)"
+    [ -n "$BACKUP_LIST" ] || die "No backups found in $BACKUP_DIR"
+}
+
+print_backup_list() {
+    SHOW_SIZE="${1:-0}"
+    BACKUP_MENU_COUNT=0
+
+    for f in $BACKUP_LIST; do
+        BACKUP_MENU_COUNT=$((BACKUP_MENU_COUNT + 1))
+        FNAME="$(basename "$f")"
+        parse_backup_filename "$FNAME"
+        if [ "$SHOW_SIZE" -eq 1 ]; then
+            SIZE="$(du -sh "$f" 2>/dev/null | awk '{print $1}')"
+            printf "  ${C_BOLD}[%s]${C_RESET} version ${C_GREEN}%s${C_RESET}  (%s)  %s  %s\n" \
+                "$BACKUP_MENU_COUNT" "$BACKUP_VER" "$BACKUP_TS" "$SIZE" "$FNAME"
+        else
+            printf "  ${C_BOLD}[%s]${C_RESET} version ${C_GREEN}%s${C_RESET}  (%s)  %s\n" \
+                "$BACKUP_MENU_COUNT" "$BACKUP_VER" "$BACKUP_TS" "$FNAME"
+        fi
+    done
+}
+
+install_binary_safe() {
+    SRC="$1"
+    DEST="$2"
+
+    # Remove a symlink at the destination so cp does not follow into a multicall target.
+    if [ -L "$DEST" ]; then
+        rm -f "$DEST" || die "Failed to remove symlink at $DEST"
+    fi
+
+    cp "$SRC" "$DEST" || die "Failed to copy binary to $DEST"
+    chmod +x "$DEST"
+}
+
 do_rollback() {
+    is_tty || die "Not running in a terminal. Run from SSH to use rollback."
+
     hr
     printf '\n'
     ui_step "Available backups:"
     printf '\n'
 
-    BACKUP_LIST="$(find "$BACKUP_DIR" -maxdepth 1 -name 'tailscale-backup-*.tar.gz' | sort -r)"
-
-    [ -n "$BACKUP_LIST" ] || die "No backups found in $BACKUP_DIR"
-
-    i=1
-    for f in $BACKUP_LIST; do
-        FNAME="$(basename "$f")"
-        VER="$(echo "$FNAME" | sed -n 's/^tailscale-backup-\([0-9][^-]*\.[^-]*\.[^-]*\)-.*/\1/p')"
-        TS="$(echo "$FNAME" | sed -n 's/^tailscale-backup-[0-9][^-]*\.[^-]*\.[^-]*-\(.*\)\.tar\.gz$/\1/p')"
-        if [ -z "$VER" ]; then
-            VER="unknown"
-            TS="$(echo "$FNAME" | sed -n 's/^tailscale-backup-\(.*\)\.tar\.gz$/\1/p')"
-        fi
-        printf "  ${C_BOLD}[%s]${C_RESET} version ${C_GREEN}%s${C_RESET}  (%s)  %s\n" "$i" "$VER" "$TS" "$FNAME"
-        i=$((i + 1))
-    done
+    list_backups
+    print_backup_list 0
 
     printf '\n'
     printf "  ${C_DIM}[c] Cancel${C_RESET}\n"
     printf '\n'
-    printf "${C_BLUE}> Select backup to restore [1-%d or c]: ${C_RESET}" "$((i - 1))"
+    printf "${C_BLUE}> Select backup to restore [1-%d or c]: ${C_RESET}" "$BACKUP_MENU_COUNT"
     read -r SELECTION
 
     if [ "$SELECTION" = "c" ] || [ "$SELECTION" = "C" ]; then
@@ -972,7 +1142,7 @@ do_rollback() {
             ;;
     esac
 
-    if [ "$SELECTION" -lt 1 ] || [ "$SELECTION" -gt "$((i - 1))" ]; then
+    if [ "$SELECTION" -lt 1 ] || [ "$SELECTION" -gt "$BACKUP_MENU_COUNT" ]; then
         die "Selection out of range."
     fi
 
@@ -1005,9 +1175,8 @@ do_rollback() {
     [ -f "$ROLLBACK_TAILSCALE" ]  || die "tailscale binary not found in backup"
     [ -f "$ROLLBACK_TAILSCALED" ] || die "tailscaled binary not found in backup"
 
-    cp "$ROLLBACK_TAILSCALE"  "$TAILSCALE_REAL"  || die "Failed to restore tailscale binary"
-    cp "$ROLLBACK_TAILSCALED" "$TAILSCALED_REAL" || die "Failed to restore tailscaled binary"
-    chmod +x "$TAILSCALE_REAL" "$TAILSCALED_REAL"
+    install_binary_safe "$ROLLBACK_TAILSCALE"  "$TAILSCALE_REAL"
+    install_binary_safe "$ROLLBACK_TAILSCALED" "$TAILSCALED_REAL"
 
     log "Binaries restored"
     "$TAILSCALE_REAL" version || die "Restored tailscale binary failed to run"
@@ -1024,34 +1193,21 @@ do_rollback() {
 }
 
 do_delete_backup() {
+    is_tty || die "Not running in a terminal. Run from SSH to delete backups."
+
     hr
     printf '\n'
     ui_step "Available backups:"
     printf '\n'
 
-    BACKUP_LIST="$(find "$BACKUP_DIR" -maxdepth 1 -name 'tailscale-backup-*.tar.gz' | sort -r)"
-
-    [ -n "$BACKUP_LIST" ] || die "No backups found in $BACKUP_DIR"
-
-    i=1
-    for f in $BACKUP_LIST; do
-        FNAME="$(basename "$f")"
-        VER="$(echo "$FNAME" | sed -n 's/^tailscale-backup-\([0-9][^-]*\.[^-]*\.[^-]*\)-.*/\1/p')"
-        TS="$(echo "$FNAME" | sed -n 's/^tailscale-backup-[0-9][^-]*\.[^-]*\.[^-]*-\(.*\)\.tar\.gz$/\1/p')"
-        if [ -z "$VER" ]; then
-            VER="unknown"
-            TS="$(echo "$FNAME" | sed -n 's/^tailscale-backup-\(.*\)\.tar\.gz$/\1/p')"
-        fi
-        SIZE="$(du -sh "$f" 2>/dev/null | awk '{print $1}')"
-        printf "  ${C_BOLD}[%s]${C_RESET} version ${C_GREEN}%s${C_RESET}  (%s)  %s  %s\n" "$i" "$VER" "$TS" "$SIZE" "$FNAME"
-        i=$((i + 1))
-    done
+    list_backups
+    print_backup_list 1
 
     printf '\n'
     printf "  ${C_YELLOW}[a] Delete ALL backups${C_RESET}\n"
     printf "  ${C_DIM}[c] Cancel${C_RESET}\n"
     printf '\n'
-    printf "${C_BLUE}> Select backup to delete [1-%d, a, or c]: ${C_RESET}" "$((i - 1))"
+    printf "${C_BLUE}> Select backup to delete [1-%d, a, or c]: ${C_RESET}" "$BACKUP_MENU_COUNT"
     read -r SELECTION
 
     if [ "$SELECTION" = "c" ] || [ "$SELECTION" = "C" ]; then
@@ -1059,18 +1215,13 @@ do_delete_backup() {
         return 0
     fi
 
-    if [ "$SELECTION" = "a" ]; then
-        printf "Delete ALL backups? This cannot be undone. [y/N]: "
-        read -r CONFIRM
-        case "$CONFIRM" in
-            y|Y)
-                rm -f "$BACKUP_DIR"/tailscale-backup-*.tar.gz
-                log "All backups deleted."
-                ;;
-            *)
-                log "Cancelled."
-                ;;
-        esac
+    if [ "$SELECTION" = "a" ] || [ "$SELECTION" = "A" ]; then
+        confirm "Delete ALL backups? This cannot be undone." "n" || {
+            log "Cancelled."
+            return 0
+        }
+        rm -f "$BACKUP_DIR"/tailscale-backup-*.tar.gz
+        log "All backups deleted."
         return 0
     fi
 
@@ -1080,24 +1231,19 @@ do_delete_backup() {
             ;;
     esac
 
-    if [ "$SELECTION" -lt 1 ] || [ "$SELECTION" -gt "$((i - 1))" ]; then
+    if [ "$SELECTION" -lt 1 ] || [ "$SELECTION" -gt "$BACKUP_MENU_COUNT" ]; then
         die "Selection out of range."
     fi
 
     SELECTED_BACKUP="$(echo "$BACKUP_LIST" | awk "NR==$SELECTION")"
     [ -f "$SELECTED_BACKUP" ] || die "Selected backup file not found: $SELECTED_BACKUP"
 
-    printf "Delete %s? [y/N]: " "$(basename "$SELECTED_BACKUP")"
-    read -r CONFIRM
-    case "$CONFIRM" in
-        y|Y)
-            rm -f "$SELECTED_BACKUP"
-            log "Deleted: $(basename "$SELECTED_BACKUP")"
-            ;;
-        *)
-            log "Cancelled."
-            ;;
-    esac
+    confirm "Delete $(basename "$SELECTED_BACKUP")?" "n" || {
+        log "Cancelled."
+        return 0
+    }
+    rm -f "$SELECTED_BACKUP"
+    log "Deleted: $(basename "$SELECTED_BACKUP")"
 }
 
 download_release() {
@@ -1194,10 +1340,8 @@ ensure_init_compat_symlink() {
 install_binaries() {
     log "Installing new binaries"
 
-    cp "$EXTRACT_DIR/tailscale"  "$TAILSCALE_REAL"  || die "Failed to copy tailscale binary to $TAILSCALE_REAL"
-    cp "$EXTRACT_DIR/tailscaled" "$TAILSCALED_REAL" || die "Failed to copy tailscaled binary to $TAILSCALED_REAL"
-
-    chmod +x "$TAILSCALE_REAL" "$TAILSCALED_REAL"
+    install_binary_safe "$EXTRACT_DIR/tailscale"  "$TAILSCALE_REAL"
+    install_binary_safe "$EXTRACT_DIR/tailscaled" "$TAILSCALED_REAL"
 
     log "Installed binaries:"
     "$TAILSCALE_REAL" version || die "New tailscale binary failed to run"
@@ -1258,7 +1402,7 @@ cleanup() {
     fi
 }
 
-interactive_preflight_display() {
+show_preflight_summary() {
     hr
     ui_step "Checking prerequisites"
     printf '\n'
@@ -1278,7 +1422,7 @@ interactive_preflight_display() {
     printf '\n'
 }
 
-interactive_update_summary() {
+confirm_update() {
     hr
     printf '\n'
     box \
@@ -1304,7 +1448,7 @@ interactive_update_summary() {
     confirm "Do you want to continue with the update?" "n" || die "Aborted by user."
 }
 
-interactive_migration_summary() {
+confirm_migration() {
     hr
     printf '\n'
     box \
@@ -1325,9 +1469,12 @@ interactive_migration_summary() {
 
     # Migration prompt is never bypassed by --yes.
     # --yes-i-have-lan-access is the explicit confirmation for migration.
-    if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
-        ui_step "Non-interactive migration confirmed by --yes-i-have-lan-access."
+    if [ "$CONFIRMED_LAN" -eq 1 ] && ! is_tty; then
         return 0
+    fi
+
+    if ! is_tty; then
+        die "Not running in a terminal. Use --yes-i-have-lan-access to proceed without prompts."
     fi
 
     while true; do
@@ -1378,6 +1525,27 @@ render_dashboard() {
     printf "  Firmware:  OpenWrt %s\n" "$FW_VER"
     printf "  LAN:       %s\n" "$LAN_IP"
     printf "  Tailscale: %s\n" "$TS_VER"
+
+    LATEST_LINE=""
+    if [ "$MENU_LATEST_STABLE" != "unknown" ] && [ -n "$MENU_LATEST_STABLE" ]; then
+        LATEST_LINE="stable ${MENU_LATEST_STABLE}"
+    fi
+    if [ "$MENU_LATEST_RC" != "unknown" ] && [ -n "$MENU_LATEST_RC" ]; then
+        [ -n "$LATEST_LINE" ] && LATEST_LINE="${LATEST_LINE}  "
+        LATEST_LINE="${LATEST_LINE}rc ${MENU_LATEST_RC}"
+    fi
+    if [ "$MENU_LATEST_UNSTABLE" != "unknown" ] && [ -n "$MENU_LATEST_UNSTABLE" ]; then
+        [ -n "$LATEST_LINE" ] && LATEST_LINE="${LATEST_LINE}  "
+        LATEST_LINE="${LATEST_LINE}unstable ${MENU_LATEST_UNSTABLE}"
+    fi
+    if [ -n "$LATEST_LINE" ]; then
+        if [ "$TS_VER" = "$MENU_LATEST_STABLE" ] && [ "$MENU_LATEST_STABLE" != "unknown" ]; then
+            printf "  Latest:    %s  ${C_GREEN}(up to date on stable)${C_RESET}\n" "$LATEST_LINE"
+        else
+            printf "  Latest:    %s\n" "$LATEST_LINE"
+        fi
+    fi
+
     printf "  Time:      %s\n" "$NOW"
     printf "  Theme:     %s\n" "$THEME_NAME"
     printf '\n'
@@ -1397,7 +1565,7 @@ show_about() {
     printf "  State:     %s\n" "$STATE_DIR"
     printf "  Backups:   %s found in %s\n" "$BACKUP_COUNT" "$BACKUP_DIR"
     printf '\n'
-    [ "$NON_INTERACTIVE" -eq 1 ] && return 0
+    is_tty || return 0
     printf "${UI_HINT}> Press Enter to return...${C_RESET}"
     read -r _DUMMY
 }
@@ -1444,12 +1612,13 @@ show_theme_menu() {
 
 show_main_menu() {
     while true; do
+        refresh_menu_versions
         render_dashboard
 
         ui_section_bar "Update"
-        ui_menu_item "1" "Update to latest stable"
-        ui_menu_item "2" "Update to latest unstable" "not for production"
-        ui_menu_item "3" "Update to latest release candidate" "use for testing only"
+        ui_menu_item "1" "Update to latest stable" "$(menu_track_hint "$MENU_LATEST_STABLE")"
+        ui_menu_item "2" "Update to latest unstable" "$(menu_track_hint "$MENU_LATEST_UNSTABLE" "not for production")"
+        ui_menu_item "3" "Update to latest release candidate" "$(menu_track_hint "$MENU_LATEST_RC" "use for testing only")"
         ui_menu_item "4" "Select a specific stable version"
         printf '\n'
 
@@ -1508,7 +1677,7 @@ main() {
         read_openwrt_release
     fi
 
-    # Show main menu when no action flags are passed and running interactively
+    # Show main menu when run with no flags in a terminal
     NO_ACTION_FLAGS=1
     [ "$FORCE" -eq 1 ]              && NO_ACTION_FLAGS=0
     [ "$DRY_RUN" -eq 1 ]            && NO_ACTION_FLAGS=0
@@ -1518,7 +1687,11 @@ main() {
     [ "$MIGRATE_MULTICALL" -eq 1 ]  && NO_ACTION_FLAGS=0
     [ "$TRACK" != "stable" ]        && NO_ACTION_FLAGS=0
 
-    if [ "$NO_ACTION_FLAGS" -eq 1 ] && [ "$NON_INTERACTIVE" -eq 0 ] && is_tty; then
+    if [ "$THEME_ONLY" -eq 1 ] && [ "$NO_ACTION_FLAGS" -eq 1 ]; then
+        exit 0
+    fi
+
+    if [ "$NO_ACTION_FLAGS" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ] && is_tty; then
         show_main_menu
     fi
 
@@ -1541,7 +1714,7 @@ main() {
 
     preflight
     current_version
-    interactive_preflight_display
+    show_preflight_summary
 
     if [ "$MIGRATE_MULTICALL" -eq 1 ]; then
         validate_migration_preconditions
@@ -1572,9 +1745,9 @@ main() {
     fi
 
     if [ "$MIGRATE_MULTICALL" -eq 1 ]; then
-        interactive_migration_summary
+        confirm_migration
     else
-        interactive_update_summary
+        confirm_update
     fi
 
     backup_current

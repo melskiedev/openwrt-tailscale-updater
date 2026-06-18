@@ -39,7 +39,31 @@ curl -sL https://raw.githubusercontent.com/melskiedev/openwrt-tailscale-updater/
 - Vanilla OpenWrt (any version)
 - Tailscale already installed
 - At least 60 MB free on `/tmp`
+- `wget` or `curl` for downloads (the script installs `wget` if missing, then tries `curl`)
+- `sha256sum` for checksum verification (`coreutils-sha256sum` on OpenWrt if not present)
 - Supported CPU: `arm64`, `arm`, `amd64`, `386`, `mips`, `mipsle`
+
+The script must use Unix line endings (LF). If you copy it from Windows and `sh -n` fails, run `tr -d '\r'` on the router before use.
+
+---
+
+## Menu
+
+Run with no arguments from SSH to open the menu:
+
+```sh
+/usr/bin/openwrt-tailscale-updater
+```
+
+The dashboard shows router info, installed Tailscale version, latest stable / release-candidate / unstable versions (fetched from `pkgs.tailscale.com`, cached for 5 minutes under `/root/tailscale-updater/version-cache-*`), and the active theme.
+
+| Section | Options |
+|---|---|
+| Update | stable, unstable, release candidate, or pick a specific stable version |
+| Recovery / Maintenance | rollback, delete old backups |
+| Options | theme picker (`t`), reset defaults (`r`), about (`a`), exit (`e`) |
+
+`--theme NAME` and `--reset-theme` set the theme and exit. They do not run an update. Use menu option `t` to change theme from the menu.
 
 ---
 
@@ -56,12 +80,11 @@ curl -sL https://raw.githubusercontent.com/melskiedev/openwrt-tailscale-updater/
 
 | Argument | Description |
 |---|---|
-| *(none)* | Show interactive menu |
+| *(none)* | Show menu |
 | `--force` | Reinstall even if already on latest version |
 | `--dry-run` | Show detected values and latest version without making changes |
 | `--keep-tmp` | Keep downloaded files in `/tmp/tailscale-update` after install |
-| `--yes` / `-y` | Skip all confirmation prompts, run unattended |
-| `--non-interactive` | Disable all prompts, use defaults, for scripted use |
+| `--yes` / `-y` | Skip confirmation prompts (use with `--force` to skip the menu and update) |
 | `--verbose` | Show detailed detection and operation logs |
 | `--theme NAME` | Set menu theme: `classic`, `green`, `amber`, `ocean`, or `mono` |
 | `--reset-theme` | Reset saved menu theme to `classic` |
@@ -84,6 +107,8 @@ curl -sL https://raw.githubusercontent.com/melskiedev/openwrt-tailscale-updater/
 
 > Stable is always the recommended track for routers and exit nodes.
 
+`--yes` skips update and delete confirmations. It does not skip the menu by itself. Migration is not confirmed by `--yes`; use `--yes-i-have-lan-access` for that. `--rollback` and `--delete-backup` require an SSH session (terminal).
+
 ---
 
 ## Usage Examples
@@ -103,9 +128,9 @@ curl -sL https://raw.githubusercontent.com/melskiedev/openwrt-tailscale-updater/
 /usr/bin/openwrt-tailscale-updater --force
 ```
 
-**Unattended update (skip prompts):**
+**Update without prompts:**
 ```sh
-/usr/bin/openwrt-tailscale-updater --yes
+/usr/bin/openwrt-tailscale-updater --yes --force
 ```
 
 **Rollback to a previous version:**
@@ -116,6 +141,12 @@ curl -sL https://raw.githubusercontent.com/melskiedev/openwrt-tailscale-updater/
 **Delete old backups:**
 ```sh
 /usr/bin/openwrt-tailscale-updater --delete-backup
+```
+
+**Set theme from CLI:**
+```sh
+/usr/bin/openwrt-tailscale-updater --theme ocean
+/usr/bin/openwrt-tailscale-updater --reset-theme
 ```
 
 **Migrate from apk multicall layout** (see Migration Mode below):
@@ -131,8 +162,10 @@ curl -sL https://raw.githubusercontent.com/melskiedev/openwrt-tailscale-updater/
 - Detects package manager (`apk` or `opkg`) by available command
 - Detects Tailscale binary paths dynamically, supports `/usr/sbin` and `/usr/bin` layouts
 - Detects init script name (`/etc/init.d/tailscaled` or `/etc/init.d/tailscale`)
-- Resolves symlinks with `readlink -f` before overwriting
+- Resolves symlinks with `readlink -f` before overwriting, and removes symlinks safely before installing separate binaries
 - Fetches latest stable version from `pkgs.tailscale.com/stable`
+- Verifies downloaded tarball checksum (`.sha256`) before extraction
+- Menu shows latest stable, release-candidate, and unstable versions (cached for 5 minutes)
 - Backs up current binaries, init script, and `/etc/tailscale/` before any change
 - Stops `tailscaled`, installs new binaries, restarts and verifies
 - Adds key paths to `/etc/sysupgrade.conf` for persistence across sysupgrade
@@ -162,7 +195,7 @@ This updater detects the multicall layout and refuses to proceed in normal mode:
 [tailscale-updater] Refusing to overwrite multicall layout.
 ```
 
-Use `apk upgrade tailscale` to stay package-managed, or use migration mode to convert to standalone binaries.
+Use `apk upgrade tailscale` to stay package-managed, or use migration mode to convert to standalone binaries. Migration mode is **apk only**. On opkg routers with a multicall layout, the menu offers stay package-managed or cancel only.
 
 ---
 
@@ -267,10 +300,12 @@ You can delete a single backup by number or all backups at once. Both options re
 Each run creates a timestamped backup before making any changes:
 
 ```
-/root/tailscale-updater/backups/tailscale-backup-YYYYMMDD-HHMMSS.tar.gz
+/root/tailscale-updater/backups/tailscale-backup-<version>-YYYYMMDD-HHMMSS.tar.gz
 ```
 
 Includes current binaries, init script, and `/etc/tailscale/`.
+
+State and cache files live under `/root/tailscale-updater/` (`backups/`, `theme.conf`, `version-cache-*`).
 
 ---
 

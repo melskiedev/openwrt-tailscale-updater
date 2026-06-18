@@ -51,6 +51,11 @@ TRACK="stable"
 MENU_LATEST_STABLE="unknown"
 MENU_LATEST_UNSTABLE="unknown"
 MENU_LATEST_RC="unknown"
+INSTALL_STATE="unknown"
+HAS_TAILSCALE_BIN=0
+HAS_TAILSCALED_BIN=0
+HAS_INIT=0
+MULTICALL_LAYOUT=0
 GITHUB_LATEST_VERSION="unknown"
 GITHUB_RELEASE_URL="https://api.github.com/repos/tailscale/tailscale/releases/latest"
 
@@ -681,6 +686,172 @@ handle_multicall_choice() {
                 ;;
             *)
                 ui_warn "$INVALID_MSG"
+                ;;
+        esac
+    done
+}
+
+probe_tailscale_binaries() {
+    TAILSCALE_BIN="$(command -v tailscale 2>/dev/null || true)"
+    TAILSCALED_BIN="$(command -v tailscaled 2>/dev/null || true)"
+
+    [ -z "$TAILSCALE_BIN" ] && [ -x /usr/sbin/tailscale ] && TAILSCALE_BIN="/usr/sbin/tailscale"
+    [ -z "$TAILSCALE_BIN" ] && [ -x /usr/bin/tailscale ]  && TAILSCALE_BIN="/usr/bin/tailscale"
+
+    [ -z "$TAILSCALED_BIN" ] && [ -x /usr/sbin/tailscaled ] && TAILSCALED_BIN="/usr/sbin/tailscaled"
+    [ -z "$TAILSCALED_BIN" ] && [ -x /usr/bin/tailscaled ]  && TAILSCALED_BIN="/usr/bin/tailscaled"
+
+    HAS_TAILSCALE_BIN=0
+    HAS_TAILSCALED_BIN=0
+    [ -n "$TAILSCALE_BIN" ]  && HAS_TAILSCALE_BIN=1
+    [ -n "$TAILSCALED_BIN" ] && HAS_TAILSCALED_BIN=1
+}
+
+probe_init_script() {
+    TAILSCALED_INIT=""
+    HAS_INIT=0
+
+    if [ -x /etc/init.d/tailscaled ]; then
+        TAILSCALED_INIT="/etc/init.d/tailscaled"
+        HAS_INIT=1
+    elif [ -x /etc/init.d/tailscale ]; then
+        TAILSCALED_INIT="/etc/init.d/tailscale"
+        HAS_INIT=1
+    fi
+}
+
+# Classify install state without dying. Order: binaries (+ multicall via readlink -f), then init.
+classify_install_state() {
+    INSTALL_STATE="unknown"
+    MULTICALL_LAYOUT=0
+    TAILSCALE_REAL=""
+    TAILSCALED_REAL=""
+
+    probe_tailscale_binaries
+
+    if [ "$HAS_TAILSCALE_BIN" -eq 1 ] && [ "$HAS_TAILSCALED_BIN" -eq 1 ]; then
+        if command -v readlink >/dev/null 2>&1 && readlink -f / >/dev/null 2>&1; then
+            TAILSCALE_REAL="$(readlink -f "$TAILSCALE_BIN")"
+            TAILSCALED_REAL="$(readlink -f "$TAILSCALED_BIN")"
+            if [ -n "$TAILSCALE_REAL" ] && [ -n "$TAILSCALED_REAL" ] \
+                && [ "$TAILSCALE_REAL" = "$TAILSCALED_REAL" ]; then
+                MULTICALL_LAYOUT=1
+            fi
+        fi
+    fi
+
+    probe_init_script
+
+    if [ "$HAS_TAILSCALE_BIN" -eq 0 ] && [ "$HAS_TAILSCALED_BIN" -eq 0 ] && [ "$HAS_INIT" -eq 0 ]; then
+        INSTALL_STATE="empty"
+        return 0
+    fi
+
+    if [ "$MULTICALL_LAYOUT" -eq 1 ]; then
+        if [ "$HAS_INIT" -eq 1 ]; then
+            INSTALL_STATE="multicall"
+        else
+            INSTALL_STATE="partial"
+        fi
+        return 0
+    fi
+
+    if [ "$HAS_TAILSCALE_BIN" -eq 1 ] && [ "$HAS_TAILSCALED_BIN" -eq 1 ] && [ "$HAS_INIT" -eq 1 ]; then
+        INSTALL_STATE="complete"
+        return 0
+    fi
+
+    INSTALL_STATE="partial"
+}
+
+report_partial_install() {
+    [ -n "${OPENWRT_RELEASE:-}" ] || read_openwrt_release
+    detect_pkg_manager
+
+    hr
+    printf '\n'
+    ui_err "Tailscale install looks incomplete on this router."
+    printf '\n'
+
+    if [ "$HAS_TAILSCALE_BIN" -eq 0 ]; then
+        ui_err "  Missing: tailscale binary"
+    fi
+    if [ "$HAS_TAILSCALED_BIN" -eq 0 ]; then
+        ui_err "  Missing: tailscaled binary"
+    fi
+    if [ "$HAS_INIT" -eq 0 ]; then
+        ui_err "  Missing: /etc/init.d/tailscaled or /etc/init.d/tailscale"
+    fi
+    if [ "$MULTICALL_LAYOUT" -eq 1 ] && [ "$HAS_INIT" -eq 0 ]; then
+        ui_warn "  Multicall binaries were found, but the init script is missing."
+    fi
+
+    printf '\n'
+    ui_step "Try reinstalling through the package manager:"
+    if [ "${PKG_MANAGER:-}" = "apk" ]; then
+        ui_step "  apk update"
+        ui_step "  apk fix tailscale"
+        ui_step "  apk add tailscale"
+    else
+        ui_step "  opkg update"
+        ui_step "  opkg install tailscale"
+    fi
+    printf '\n'
+    ui_step "This updater does not auto-repair partial installs."
+    exit 1
+}
+
+show_first_run_menu() {
+    [ -n "${OPENWRT_RELEASE:-}" ] || read_openwrt_release
+    detect_pkg_manager
+
+    while true; do
+        hr
+        printf '\n'
+        ui_warn "Tailscale is not installed on this router."
+        printf '\n'
+
+        ui_section_bar "Install"
+        ui_menu_item "1" "Install via OpenWrt package manager" "recommended"
+        ui_menu_item "2" "Install upstream static binaries"
+        printf '\n'
+
+        ui_section_bar "Options"
+        ui_menu_item "e" "Exit"
+        printf '\n'
+
+        printf "${C_BLUE}> Select [1, 2, or e]: ${C_RESET}"
+        read -r CHOICE
+
+        case "$CHOICE" in
+            1)
+                printf '\n'
+                ui_step "Package install from this script: coming in v1.4.0-rc1."
+                ui_step "For now, run:"
+                printf '\n'
+                if [ "${PKG_MANAGER:-}" = "apk" ]; then
+                    ui_step "  apk update && apk add tailscale"
+                else
+                    ui_step "  opkg update && opkg install tailscale"
+                fi
+                printf '\n'
+                ui_step "Then run: tailscale up"
+                ui_step "Re-run this updater to update or migrate to upstream binaries."
+                ui_warn "apk installs a multicall layout. To switch to upstream binaries later, run this updater and choose Migrate."
+                exit 0
+                ;;
+            2)
+                printf '\n'
+                ui_step "Upstream binary install from this script: coming in v1.4.0-rc2."
+                ui_step "For now, install via the package manager (option 1) or wait for the next release."
+                exit 0
+                ;;
+            e|E)
+                log "Cancelled by user."
+                exit 0
+                ;;
+            *)
+                ui_warn "Please select 1, 2, or e."
                 ;;
         esac
     done
@@ -1690,6 +1861,23 @@ main() {
     if [ "$THEME_ONLY" -eq 1 ] && [ "$NO_ACTION_FLAGS" -eq 1 ]; then
         exit 0
     fi
+
+    classify_install_state
+
+    case "$INSTALL_STATE" in
+        partial)
+            report_partial_install
+            ;;
+        empty)
+            if [ "$ROLLBACK" -eq 1 ] || [ "$DELETE_BACKUP" -eq 1 ]; then
+                die "Tailscale is not installed. Nothing to roll back or delete."
+            fi
+            if [ "$NO_ACTION_FLAGS" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ] && is_tty; then
+                show_first_run_menu
+            fi
+            die "Tailscale is not installed. Run from SSH with no flags to see install options, or use apk/opkg add tailscale."
+            ;;
+    esac
 
     if [ "$NO_ACTION_FLAGS" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ] && is_tty; then
         show_main_menu

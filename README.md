@@ -1,6 +1,6 @@
 # openwrt-tailscale-updater
 
-A vanilla OpenWrt Tailscale updater for routers running standard OpenWrt with Tailscale already installed.
+A vanilla OpenWrt Tailscale **updater** for routers that already have Tailscale installed. It does not install Tailscale on a blank router; use the package manager first (see [First-Time Install](#first-time-install)).
 
 No vendor-specific logic. No UPX. No tiny binaries. It detects `apk` or `opkg`, resolves the active Tailscale binary and init paths, protects multicall installs, and can migrate apk-managed multicall layouts to standalone upstream binaries when explicitly requested.
 
@@ -37,13 +37,39 @@ curl -sL https://raw.githubusercontent.com/melskiedev/openwrt-tailscale-updater/
 ## Requirements
 
 - Vanilla OpenWrt (any version)
-- Tailscale already installed
+- Tailscale already installed (see [First-Time Install](#first-time-install) for a fresh router)
 - At least 60 MB free on `/tmp`
 - `wget` or `curl` for downloads (the script installs `wget` if missing, then tries `curl`)
 - `sha256sum` for checksum verification (`coreutils-sha256sum` on OpenWrt if not present)
 - Supported CPU: `arm64`, `arm`, `amd64`, `386`, `mips`, `mipsle`
 
 The script must use Unix line endings (LF). If you copy it from Windows and `sh -n` fails, run `tr -d '\r'` on the router before use.
+
+---
+
+## First-Time Install
+
+This script is an **updater**. It expects `tailscale`, `tailscaled`, and an OpenWrt init script to already exist. It does not perform a greenfield install yet.
+
+On a fresh router with no Tailscale, install through the OpenWrt package manager first:
+
+```sh
+# OpenWrt 25.12+
+apk update && apk add tailscale
+
+# OpenWrt 24.10 and older
+opkg update && opkg install tailscale
+```
+
+Then authenticate and configure Tailscale as you normally would (`tailscale up`, etc.).
+
+Verify the updater sees your install:
+
+```sh
+/usr/bin/openwrt-tailscale-updater --dry-run
+```
+
+If the package install uses a multicall layout (both binaries resolve to one file), the updater will detect it and offer migration to standalone upstream binaries. See [Migration Mode](#migration-mode).
 
 ---
 

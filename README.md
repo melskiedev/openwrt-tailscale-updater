@@ -149,7 +149,7 @@ Run with no arguments from SSH:
 
 > Stable is always the recommended track for routers and exit nodes.
 
-`--yes` skips update and delete confirmations. It does not skip the menu by itself. Migration is not confirmed by `--yes`; use `--yes-i-have-lan-access` for that. `--rollback` and `--delete-backup` require an SSH session (terminal).
+`--yes` skips update and delete confirmations. With no other action flags, it also skips the main menu and proceeds with a stable update. Migration is not confirmed by `--yes`; use `--yes-i-have-lan-access` for that. `--rollback` and `--delete-backup` require an SSH session (terminal) and work even when Tailscale is not currently installed, as long as backups exist.
 
 ---
 
@@ -322,11 +322,11 @@ The rollback menu lists available backups with version and timestamp:
 Select backup to restore [1-2]:
 ```
 
-Rollback restores the `tailscale` and `tailscaled` binaries using paths recorded in the backup. Node identity at `/etc/tailscale/` is not touched.
+Rollback restores the `tailscale` and `tailscaled` binaries and the init script using paths recorded in the backup. Node identity at `/etc/tailscale/` is not touched.
 
 Backups created by v1.4.0-rc1 and later include `.tailscale-backup-meta` inside the tarball (binary paths, init script, version, multicall flag). A readable copy is also written beside the archive as `tailscale-backup-<version>-<timestamp>.tar.gz.meta`.
 
-Older backups without metadata still work: rollback falls back to the currently detected paths and prints a warning. That fallback may fail if the router layout changed since the backup was created (for example, before or after multicall migration).
+Older backups without metadata still work when Tailscale binaries are currently installed: rollback falls back to the currently detected paths and prints a warning. That fallback may fail if the router layout changed since the backup was created (for example, before or after multicall migration). Backups with metadata can be restored even when binaries and the init script are missing, as long as the backup archive is intact.
 
 ---
 

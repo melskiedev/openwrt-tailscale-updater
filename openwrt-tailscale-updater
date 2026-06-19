@@ -857,6 +857,42 @@ show_first_run_menu() {
     done
 }
 
+detect_tailscale_paths_if_present() {
+    TAILSCALE_BIN="$(command -v tailscale 2>/dev/null || true)"
+    TAILSCALED_BIN="$(command -v tailscaled 2>/dev/null || true)"
+
+    [ -z "$TAILSCALE_BIN" ] && [ -x /usr/sbin/tailscale ] && TAILSCALE_BIN="/usr/sbin/tailscale"
+    [ -z "$TAILSCALE_BIN" ] && [ -x /usr/bin/tailscale ]  && TAILSCALE_BIN="/usr/bin/tailscale"
+
+    [ -z "$TAILSCALED_BIN" ] && [ -x /usr/sbin/tailscaled ] && TAILSCALED_BIN="/usr/sbin/tailscaled"
+    [ -z "$TAILSCALED_BIN" ] && [ -x /usr/bin/tailscaled ]  && TAILSCALED_BIN="/usr/bin/tailscaled"
+
+    [ -n "$TAILSCALE_BIN" ]  || return 1
+    [ -n "$TAILSCALED_BIN" ] || return 1
+
+    command -v readlink >/dev/null 2>&1 || return 1
+    readlink -f / >/dev/null 2>&1 || return 1
+
+    TAILSCALE_REAL="$(readlink -f "$TAILSCALE_BIN")"
+    TAILSCALED_REAL="$(readlink -f "$TAILSCALED_BIN")"
+
+    [ -n "$TAILSCALE_REAL" ]  || return 1
+    [ -n "$TAILSCALED_REAL" ] || return 1
+    return 0
+}
+
+detect_tailscaled_service_if_present() {
+    if [ -x /etc/init.d/tailscaled ]; then
+        TAILSCALED_INIT="/etc/init.d/tailscaled"
+        return 0
+    fi
+    if [ -x /etc/init.d/tailscale ]; then
+        TAILSCALED_INIT="/etc/init.d/tailscale"
+        return 0
+    fi
+    return 1
+}
+
 detect_tailscale_paths() {
     TAILSCALE_BIN="$(command -v tailscale 2>/dev/null || true)"
     TAILSCALED_BIN="$(command -v tailscaled 2>/dev/null || true)"
@@ -1015,6 +1051,12 @@ safe_detect_for_menu() {
     [ -n "${TS_ARCH:-}" ] || detect_arch
 }
 
+read_version_cache() {
+    CACHE_PATH="$1"
+    [ -f "$CACHE_PATH" ] || return 1
+    tr -d '\n\r' < "$CACHE_PATH"
+}
+
 fetch_track_latest_version() {
     TRACK_NAME="$1"
     CACHE_FILE="$STATE_DIR/version-cache-${TRACK_NAME}"
@@ -1024,13 +1066,15 @@ fetch_track_latest_version() {
         CACHE_MTIME="$(date -r "$CACHE_FILE" +%s 2>/dev/null || echo 0)"
         NOW_TS="$(date +%s)"
         if [ "$CACHE_MTIME" -gt 0 ] && [ $((NOW_TS - CACHE_MTIME)) -lt "$CACHE_MAX_AGE" ]; then
-            cat "$CACHE_FILE"
+            read_version_cache "$CACHE_FILE"
             return 0
         fi
     fi
 
     command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1 || {
-        [ -f "$CACHE_FILE" ] && cat "$CACHE_FILE"
+        if read_version_cache "$CACHE_FILE"; then
+            return 0
+        fi
         echo "unknown"
         return 1
     }
@@ -1041,7 +1085,9 @@ fetch_track_latest_version() {
     rm -f "$INDEX_FILE"
 
     http_get "https://pkgs.tailscale.com/${TRACK_NAME}/" "$INDEX_FILE" || {
-        [ -f "$CACHE_FILE" ] && cat "$CACHE_FILE"
+        if read_version_cache "$CACHE_FILE"; then
+            return 0
+        fi
         echo "unknown"
         return 1
     }
@@ -1049,7 +1095,7 @@ fetch_track_latest_version() {
     VER="$(parse_latest_version_from_index "$INDEX_FILE" || echo "")"
     [ -n "$VER" ] || VER="unknown"
     if [ "$VER" != "unknown" ]; then
-        printf '%s' "$VER" > "$CACHE_FILE"
+        printf '%s\n' "$VER" > "$CACHE_FILE"
     fi
     printf '%s' "$VER"
 }
@@ -1351,6 +1397,34 @@ install_binary_safe() {
     chmod +x "$DEST"
 }
 
+restore_init_from_backup() {
+    INIT_DEST="$1"
+    INIT_SRC="${ROLLBACK_TMP}${INIT_DEST}"
+
+    [ -n "$INIT_DEST" ] || return 1
+    [ -f "$INIT_SRC" ] || return 1
+
+    cp "$INIT_SRC" "$INIT_DEST" || die "Failed to restore init script to $INIT_DEST"
+    chmod +x "$INIT_DEST"
+    log "Init script restored: $INIT_DEST"
+    return 0
+}
+
+resolve_restore_init_from_backup() {
+    if [ -n "${RESTORE_INIT:-}" ] && restore_init_from_backup "$RESTORE_INIT"; then
+        return 0
+    fi
+
+    for CAND in /etc/init.d/tailscaled /etc/init.d/tailscale; do
+        if restore_init_from_backup "$CAND"; then
+            RESTORE_INIT="$CAND"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 do_rollback() {
     is_tty || die "Not running in a terminal. Run from SSH to use rollback."
 
@@ -1407,18 +1481,36 @@ do_rollback() {
         ui_warn "No metadata found for this backup. Using current detected paths."
         ui_warn "Rollback may fail if layout changed since this backup was created."
         logger -t "$LOGTAG" "WARNING: backup has no metadata; using current detected paths" 2>/dev/null || true
-        RESTORE_TAILSCALE_REAL="$TAILSCALE_REAL"
-        RESTORE_TAILSCALED_REAL="$TAILSCALED_REAL"
-        RESTORE_INIT="$TAILSCALED_INIT"
+        if detect_tailscale_paths_if_present; then
+            RESTORE_TAILSCALE_REAL="$TAILSCALE_REAL"
+            RESTORE_TAILSCALED_REAL="$TAILSCALED_REAL"
+            RESTORE_INIT=""
+            TAILSCALED_INIT=""
+            if detect_tailscaled_service_if_present; then
+                RESTORE_INIT="$TAILSCALED_INIT"
+            elif [ -f "$ROLLBACK_TMP/etc/init.d/tailscaled" ]; then
+                RESTORE_INIT="/etc/init.d/tailscaled"
+            elif [ -f "$ROLLBACK_TMP/etc/init.d/tailscale" ]; then
+                RESTORE_INIT="/etc/init.d/tailscale"
+            else
+                die "No metadata in backup and no init script found on router or in backup."
+            fi
+        else
+            die "No metadata in backup and Tailscale binaries are not installed. Cannot determine restore paths."
+        fi
     fi
 
     [ -n "$RESTORE_TAILSCALE_REAL" ]  || die "Backup metadata missing tailscale_real"
     [ -n "$RESTORE_TAILSCALED_REAL" ] || die "Backup metadata missing tailscaled_real"
-    [ -n "$RESTORE_INIT" ]            || RESTORE_INIT="$TAILSCALED_INIT"
+
+    command -v readlink >/dev/null 2>&1 || die "readlink is missing"
+    readlink -f / >/dev/null 2>&1 || die "readlink -f is not supported on this system"
 
     # Stop daemon before restoring
     log "Stopping tailscaled"
-    "$RESTORE_INIT" stop 2>/dev/null || true
+    if [ -n "$RESTORE_INIT" ] && [ -x "$RESTORE_INIT" ]; then
+        "$RESTORE_INIT" stop 2>/dev/null || true
+    fi
     sleep 3
     if pidof tailscaled >/dev/null 2>&1; then
         killall tailscaled 2>/dev/null || true
@@ -1438,9 +1530,15 @@ do_rollback() {
     log "Binaries restored"
     "$RESTORE_TAILSCALE_REAL" version || die "Restored tailscale binary failed to run"
 
+    resolve_restore_init_from_backup || die "Init script not found in backup. Expected /etc/init.d/tailscaled or /etc/init.d/tailscale."
+
     # Restart
-    "$RESTORE_INIT" enable 2>/dev/null || true
-    "$RESTORE_INIT" start || die "Failed to start tailscaled after rollback"
+    if [ -n "$RESTORE_INIT" ] && [ -x "$RESTORE_INIT" ]; then
+        "$RESTORE_INIT" enable 2>/dev/null || true
+        "$RESTORE_INIT" start || die "Failed to start tailscaled after rollback"
+    else
+        die "Init script from backup is missing or not executable: ${RESTORE_INIT:-unknown}"
+    fi
     sleep 8
     pidof tailscaled >/dev/null 2>&1 || die "tailscaled did not start after rollback"
 
@@ -1478,7 +1576,7 @@ do_delete_backup() {
             log "Cancelled."
             return 0
         }
-        rm -f "$BACKUP_DIR"/tailscale-backup-*.tar.gz
+        rm -f "$BACKUP_DIR"/tailscale-backup-*.tar.gz "$BACKUP_DIR"/tailscale-backup-*.tar.gz.meta
         log "All backups deleted."
         return 0
     fi
@@ -1500,7 +1598,7 @@ do_delete_backup() {
         log "Cancelled."
         return 0
     }
-    rm -f "$SELECTED_BACKUP"
+    rm -f "$SELECTED_BACKUP" "${SELECTED_BACKUP}.meta"
     log "Deleted: $(basename "$SELECTED_BACKUP")"
 }
 
@@ -1561,7 +1659,7 @@ remove_apk_package() {
     INIT_BACKUP="$STATE_DIR/tailscaled.init.bak"
     cp "$TAILSCALED_INIT" "$INIT_BACKUP" || die "Failed to backup init script before apk del"
 
-    apk del tailscale || log "WARN: apk del tailscale returned non-zero. Continuing."
+    apk del tailscale || die "apk del tailscale failed. Aborting migration to avoid inconsistent package state."
 
     # Restore init script if apk del removed it
     if [ ! -x "$TAILSCALED_INIT" ]; then
@@ -1912,6 +2010,17 @@ show_main_menu() {
     done
 }
 
+run_recovery_action() {
+    if [ "$DELETE_BACKUP" -eq 1 ]; then
+        do_delete_backup
+    elif [ "$ROLLBACK" -eq 1 ]; then
+        do_rollback
+    else
+        return 1
+    fi
+    exit 0
+}
+
 acquire_lock() {
     if [ -f "$LOCK_FILE" ]; then
         OLD_PID="$(cat "$LOCK_FILE" 2>/dev/null || true)"
@@ -1950,6 +2059,11 @@ main() {
         exit 0
     fi
 
+    # Rollback and delete-backup work even when Tailscale is missing or partially installed.
+    if [ "$ROLLBACK" -eq 1 ] || [ "$DELETE_BACKUP" -eq 1 ]; then
+        run_recovery_action
+    fi
+
     classify_install_state
 
     case "$INSTALL_STATE" in
@@ -1957,9 +2071,6 @@ main() {
             report_partial_install
             ;;
         empty)
-            if [ "$ROLLBACK" -eq 1 ] || [ "$DELETE_BACKUP" -eq 1 ]; then
-                die "Tailscale is not installed. Nothing to roll back or delete."
-            fi
             if [ "$NO_ACTION_FLAGS" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ] && is_tty; then
                 show_first_run_menu
             fi
@@ -1971,21 +2082,9 @@ main() {
         show_main_menu
     fi
 
-    # Rollback and delete-backup only need path detection, not full preflight
+    # Menu options 5/6 set ROLLBACK or DELETE_BACKUP after the early dispatch above.
     if [ "$ROLLBACK" -eq 1 ] || [ "$DELETE_BACKUP" -eq 1 ]; then
-        [ -n "${OPENWRT_RELEASE:-}" ] || read_openwrt_release
-        detect_pkg_manager
-        detect_arch
-        command -v readlink >/dev/null 2>&1 || die "readlink is missing"
-        readlink -f / >/dev/null 2>&1 || die "readlink -f is not supported on this system"
-        detect_tailscale_paths
-        detect_tailscaled_service
-        if [ "$ROLLBACK" -eq 1 ]; then
-            do_rollback
-        else
-            do_delete_backup
-        fi
-        exit 0
+        run_recovery_action
     fi
 
     preflight

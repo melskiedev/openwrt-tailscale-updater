@@ -1,6 +1,6 @@
 # openwrt-tailscale-updater
 
-A vanilla OpenWrt Tailscale **updater** for routers with Tailscale already installed. On a router with no Tailscale yet, running the script from SSH shows a first-run install menu (package install and upstream binary install are rolling out in v1.4.0).
+A vanilla OpenWrt Tailscale **updater** for routers with Tailscale already installed. On a router with no Tailscale yet, running the script from SSH shows a first-run menu with install instructions.
 
 No vendor-specific logic. No UPX. No tiny binaries. It detects `apk` or `opkg`, resolves the active Tailscale binary and init paths, protects multicall installs, and can migrate apk-managed multicall layouts to standalone upstream binaries when explicitly requested.
 
@@ -36,7 +36,7 @@ curl -sL https://raw.githubusercontent.com/melskiedev/openwrt-tailscale-updater/
 
 ## Requirements
 
-- Vanilla OpenWrt (any version)
+- Vanilla OpenWrt (any version). Vendor firmware builds are not supported (see [Known Limitations](#known-limitations))
 - Tailscale installed for update mode (see [First-Time Install](#first-time-install) if nothing is installed yet)
 - At least 60 MB free on `/tmp`
 - `wget` or `curl` for downloads (the script installs `wget` if missing, then tries `curl`)
@@ -59,13 +59,13 @@ You will see a first-run menu:
 
 | Option | Description |
 |---|---|
-| **1** | Install via OpenWrt package manager (recommended; full automation in v1.4.0-rc1) |
-| **2** | Install upstream static binaries (v1.4.0-rc2) |
+| **1** | Install via OpenWrt package manager (recommended) |
+| **2** | Install upstream static binaries |
 | **e** | Exit |
 
-Until v1.4.0-rc1/rc2 ship, option 1 prints the manual package-manager commands. Option 2 is not available yet.
+Option 1 prints the package-manager commands to run. Option 2 is not available from this script; install with the package manager instead. On apk routers you can then use [Migration Mode](#migration-mode) to switch to upstream binaries.
 
-**Manual package install** (works today):
+**Manual package install:**
 
 ```sh
 # OpenWrt 25.12+
@@ -124,7 +124,7 @@ Run with no arguments from SSH:
 |---|---|
 | *(none)* | Show menu (updater menu if installed, first-run install menu if not) |
 | `--force` | Reinstall even if already on latest version |
-| `--dry-run` | Show detected values, latest version, init layout problems, and the owning procd service without making changes |
+| `--dry-run` | Show detected values, latest version, init layout problems, the owning procd service, and duplicate or unmanaged `tailscaled` processes without making changes |
 | `--keep-tmp` | Keep downloaded files in `/tmp/tailscale-update` after install |
 | `--yes` / `-y` | Skip confirmation prompts (use with `--force` to skip the menu and update) |
 | `--verbose` | Show detailed detection and operation logs |
@@ -293,20 +293,28 @@ Earlier versions of migration mode created `/etc/init.d/tailscaled` as a symlink
 3. Writes one real `/etc/init.d/tailscaled` (copied from the existing real script) and removes `/etc/init.d/tailscale`
 4. Runs `/etc/init.d/tailscaled enable`
 
-A router that already has one real `/etc/init.d/tailscaled` is not touched. A plain package install with only `/etc/init.d/tailscale` is also left as is. `--dry-run` reports the problem and the owning procd service but never normalizes. If the router is already on the latest version, no update runs and nothing is normalized; use `--force` to normalize.
+A router that already has one real `/etc/init.d/tailscaled` is not touched. A plain package install with only `/etc/init.d/tailscale` is also left as is. On vendor firmware the updater reports the layout problem and changes no init scripts or boot links. `--dry-run` reports the layout problem, the owning procd service, and any duplicate or unmanaged `tailscaled` processes, but never normalizes and never stops on those problems. If the router is already on the latest version, no update runs and nothing is normalized; use `--force` to normalize.
 
 **Stop.** The updater finds the procd service whose instance PID is the running `tailscaled` and removes that service (`ubus call service delete`), plus any Tailscale service procd still holds in a crash loop. `killall` is only a last resort. It then waits longer than the procd respawn timeout (5 seconds by default) and aborts before installing anything if `tailscaled` came back. The old version keeps running in that case.
 
 **Start.** The updater refuses to start `tailscaled` if any `tailscaled` process or Tailscale procd service still exists.
 
-**Verification.** `tailscale status` alone is not enough: it can succeed while the dataplane is broken. After the respawn window the updater requires:
+**Verification.** `tailscale status` alone is not enough: it can succeed while the dataplane is broken. Before stopping, the updater records the node's backend state from `tailscale status --json`. After the respawn window it always requires:
 
 - exactly one `tailscaled` process
 - owned by exactly one procd service, matching the init script
-- the node's IPv4 from `tailscale ip -4` present on `tailscale0`
 - no `safesocket.Listen`, `stale Tailscale address`, or procd `crash loop` lines in syslog since the start
 
-If any check fails, the update stops with an error. The node must be logged in and running, with a `tailscale0` interface, for verification to pass. Update, migration, and rollback all use the same stop, start, and verification steps.
+If the backend state was `Running` before the update, it also requires the node's IPv4 from `tailscale ip -4` to be present on `tailscale0`. A node that was logged out, stopped, or not readable before the update passes on the process and owner checks alone, and the updater says so; check `tailscale status` yourself in that case.
+
+If any check fails, the update stops with an error. Update, migration, and rollback all use the same stop, start, and verification steps.
+
+---
+
+## Known Limitations
+
+- **Vendor firmware is not supported.** Vendor firmware builds ship and manage their own Tailscale integration. Use the vendor's update path there. If this updater is run on vendor firmware anyway, it never normalizes init scripts.
+- **No coordination with external restart tools.** The updater does not take a lock that other tools (for example a cron watchdog that restarts `tailscaled` when the dataplane looks unhealthy) would respect. Such a tool can restart `tailscaled` while an update has it stopped, which can start a daemon before the new binaries are in place. Pause any such watchdog while updating.
 
 ---
 

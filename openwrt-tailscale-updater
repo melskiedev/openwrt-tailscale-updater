@@ -70,7 +70,10 @@ ALT_INIT="/etc/init.d/tailscale"
 TAILSCALED_INIT=""
 NEED_INIT_NORMALIZE=0
 INIT_LAYOUT_PROBLEM=""
+OWNERSHIP_PROBLEM=""
 VERIFY_MARK=""
+PRE_BACKEND_STATE="unknown"
+VENDOR_FIRMWARE=""
 
 # procd's default respawn timeout is 5 s. Both waits must exceed it.
 RESPAWN_GUARD="${RESPAWN_GUARD:-7}"
@@ -810,23 +813,32 @@ detect_init_layout_problem() {
     [ -z "$INIT_LAYOUT_PROBLEM" ]
 }
 
-# Refuse to proceed with duplicate or unmanaged daemons.
+# Refuse to proceed with duplicate or unmanaged daemons. In --dry-run the
+# problem is recorded in OWNERSHIP_PROBLEM and reported instead.
 check_tailscaled_ownership() {
+    OWNERSHIP_PROBLEM=""
     _cto_pids="$(pidof tailscaled 2>/dev/null || true)"
     # Word splitting is intended: one positional parameter per pid.
     # shellcheck disable=SC2086
     set -- $_cto_pids
 
     if [ "$#" -gt 1 ]; then
-        die "Multiple tailscaled processes running ($_cto_pids). Resolve this before updating."
-    fi
-
-    if [ "$#" -eq 1 ]; then
+        OWNERSHIP_PROBLEM="Multiple tailscaled processes running ($_cto_pids)"
+    elif [ "$#" -eq 1 ]; then
         _cto_owner="$(tailscaled_owner_services | sort -u)"
         if [ -z "$_cto_owner" ]; then
-            die "tailscaled (pid $1) is not owned by any procd service. Refusing to update an unmanaged daemon."
+            OWNERSHIP_PROBLEM="tailscaled (pid $1) is not owned by any procd service"
+        else
+            vlog "Running tailscaled pid $1 is owned by procd service: $_cto_owner"
         fi
-        vlog "Running tailscaled pid $1 is owned by procd service: $_cto_owner"
+    fi
+
+    if [ -n "$OWNERSHIP_PROBLEM" ]; then
+        if [ "${DRY_RUN:-0}" -eq 1 ]; then
+            ui_warn "$OWNERSHIP_PROBLEM. A real update would refuse to run."
+            return 0
+        fi
+        die "$OWNERSHIP_PROBLEM. Refusing to update until this is resolved."
     fi
 
     return 0
@@ -845,11 +857,55 @@ wait_tailscaled_gone() {
     return 0
 }
 
+# Vendor firmware builds manage their own Tailscale init scripts and are not
+# supported. Detected by /etc/glversion or any installed gl-* package.
+# The result is cached in VENDOR_FIRMWARE (1 or 0).
+is_vendor_firmware() {
+    if [ -z "$VENDOR_FIRMWARE" ]; then
+        VENDOR_FIRMWARE=0
+        if [ -f /etc/glversion ]; then
+            VENDOR_FIRMWARE=1
+        elif ls /usr/lib/opkg/info/gl-*.control >/dev/null 2>&1; then
+            VENDOR_FIRMWARE=1
+        elif grep -q '^P:gl-' /lib/apk/db/installed 2>/dev/null; then
+            VENDOR_FIRMWARE=1
+        elif command -v apk >/dev/null 2>&1 && apk list --installed 2>/dev/null | grep -q '^gl-'; then
+            VENDOR_FIRMWARE=1
+        elif command -v opkg >/dev/null 2>&1 && opkg list-installed 2>/dev/null | grep -q '^gl-'; then
+            VENDOR_FIRMWARE=1
+        fi
+    fi
+    [ "$VENDOR_FIRMWARE" -eq 1 ]
+}
+
+# Record the backend state before stopping, so verification knows whether
+# the node is expected to come back with an address on tailscale0.
+capture_backend_state() {
+    PRE_BACKEND_STATE="unknown"
+    _cbs_cli="${TAILSCALE_BIN:-}"
+    if [ -z "$_cbs_cli" ] || [ ! -x "$_cbs_cli" ]; then
+        _cbs_cli="$(command -v tailscale 2>/dev/null || true)"
+    fi
+    [ -n "$_cbs_cli" ] || return 0
+    _cbs_s="$("$_cbs_cli" status --json 2>/dev/null \
+        | sed -n 's/^[[:space:]]*"BackendState":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+    [ -n "$_cbs_s" ] && PRE_BACKEND_STATE="$_cbs_s"
+    vlog "Backend state before stop: $PRE_BACKEND_STATE"
+    return 0
+}
+
 # Convert any split layout into one real $CANON_INIT. Daemon must be stopped.
 # Does nothing unless NEED_INIT_NORMALIZE=1, so a layout that is already a
-# single real /etc/init.d/tailscaled is never touched.
+# single real /etc/init.d/tailscaled is never touched. On vendor firmware it
+# reports the problem and changes nothing.
 normalize_init_layout() {
     [ "$NEED_INIT_NORMALIZE" -eq 1 ] || return 0
+
+    if is_vendor_firmware; then
+        log "Vendor firmware detected. Init layout NOT normalized: ${INIT_LAYOUT_PROBLEM:-normalization requested}"
+        log "Init scripts and boot links left unchanged. Vendor firmware is not supported by this updater."
+        return 0
+    fi
 
     if pidof tailscaled >/dev/null 2>&1; then
         die "normalize_init_layout called while tailscaled is running"
@@ -896,6 +952,8 @@ normalize_init_layout() {
 }
 
 stop_tailscaled() {
+    capture_backend_state
+
     log "Stopping tailscaled"
 
     _st_owners="$(tailscaled_owner_services | sort -u)"
@@ -992,6 +1050,20 @@ verify_tailscaled_running() {
         fi
     done
 
+    if [ -n "$VERIFY_MARK" ] && \
+       logread 2>/dev/null | sed -n "/$VERIFY_MARK/,\$p" | \
+       grep -qE 'safesocket.Listen|stale Tailscale address|crash loop'; then
+        die "Duplicate tailscaled or procd crash loop detected in syslog since start"
+    fi
+
+    # The address is only expected if the node was Running before the stop.
+    # A logged-out, stopped, or unreadable node passes on pid and owner alone.
+    if [ "$PRE_BACKEND_STATE" != "Running" ]; then
+        log "Backend state before the update was '$PRE_BACKEND_STATE'; not requiring an address on tailscale0"
+        log "tailscaled verified: pid $_vt_pid, service '$_vt_want' (check 'tailscale status' yourself)"
+        return 0
+    fi
+
     # Backend must report its IPv4 AND the kernel must hold it on tailscale0.
     # Uses the installed CLI path; TAILSCALE_BIN can still be a multicall link.
     _vt_cli="${TAILSCALE_REAL:-tailscale}"
@@ -1010,6 +1082,7 @@ verify_tailscaled_running() {
         die "tailscale0 is missing $_vt_ip (dataplane not built)"
     fi
 
+    # Re-check syslog after the address wait; a late duplicate shows up here.
     if [ -n "$VERIFY_MARK" ] && \
        logread 2>/dev/null | sed -n "/$VERIFY_MARK/,\$p" | \
        grep -qE 'safesocket.Listen|stale Tailscale address|crash loop'; then
@@ -1133,8 +1206,7 @@ show_first_run_menu() {
         case "$CHOICE" in
             1)
                 printf '\n'
-                ui_step "Package install from this script: coming in v1.4.0-rc1."
-                ui_step "For now, run:"
+                ui_step "Install Tailscale with the package manager:"
                 printf '\n'
                 if [ "${PKG_MANAGER:-}" = "apk" ]; then
                     ui_step "  apk update && apk add tailscale"
@@ -1149,8 +1221,8 @@ show_first_run_menu() {
                 ;;
             2)
                 printf '\n'
-                ui_step "Upstream binary install from this script: coming in v1.4.0-rc2."
-                ui_step "For now, install via the package manager (option 1) or wait for the next release."
+                ui_step "Upstream binary install is not available from this script."
+                ui_step "Install via the package manager (option 1). On apk routers you can then migrate to upstream binaries."
                 exit 0
                 ;;
             e|E)
@@ -1238,7 +1310,11 @@ detect_tailscaled_service() {
 
     if ! detect_init_layout_problem; then
         log "Init layout problem: $INIT_LAYOUT_PROBLEM"
-        log "Will normalize to a single real $CANON_INIT while tailscaled is stopped (not in --dry-run)"
+        if is_vendor_firmware; then
+            log "Vendor firmware detected: the init layout will NOT be normalized (unsupported firmware)"
+        else
+            log "Will normalize to a single real $CANON_INIT while tailscaled is stopped (not in --dry-run)"
+        fi
         NEED_INIT_NORMALIZE=1
     fi
 
@@ -2420,9 +2496,19 @@ main() {
             "procd owner:       $DRY_OWNER"
         if [ -n "$INIT_LAYOUT_PROBLEM" ]; then
             ui_warn "INIT_LAYOUT_PROBLEM: $INIT_LAYOUT_PROBLEM"
-            ui_warn "A real update would normalize this to a single real $CANON_INIT."
+            if is_vendor_firmware; then
+                ui_warn "Vendor firmware detected: a real update would NOT normalize this (unsupported firmware)."
+            else
+                ui_warn "A real update would normalize this to a single real $CANON_INIT."
+            fi
         else
             ui_ok "INIT_LAYOUT_PROBLEM: none (init layout would not be changed)"
+        fi
+        if [ -n "$OWNERSHIP_PROBLEM" ]; then
+            ui_warn "OWNERSHIP_PROBLEM: $OWNERSHIP_PROBLEM"
+            ui_warn "A real update would refuse to run until this is resolved."
+        else
+            ui_ok "OWNERSHIP_PROBLEM: none"
         fi
         cleanup
         exit 0
@@ -2431,7 +2517,7 @@ main() {
     if [ "$CURRENT_VERSION" = "$LATEST_VERSION" ] && [ "$FORCE" -ne 1 ] && [ "$MIGRATE_MULTICALL" -ne 1 ] && [ "$SELECT_RELEASE" -ne 1 ]; then
         ui_ok "Already on latest version ($CURRENT_VERSION). Use --force to reinstall."
         logger -t "$LOGTAG" "Already on latest version ($CURRENT_VERSION). Use --force to reinstall." 2>/dev/null || true
-        if [ "$NEED_INIT_NORMALIZE" -eq 1 ]; then
+        if [ "$NEED_INIT_NORMALIZE" -eq 1 ] && ! is_vendor_firmware; then
             ui_warn "Init layout problem was NOT fixed because no update ran. Use --force to normalize it."
         fi
         cleanup

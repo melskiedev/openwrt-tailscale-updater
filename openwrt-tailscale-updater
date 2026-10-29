@@ -13,11 +13,14 @@
 # - Detects package manager
 # - Detects Tailscale binary paths dynamically (supports /usr/sbin and /usr/bin layouts)
 # - Detects Tailscale init script (/etc/init.d/tailscaled or /etc/init.d/tailscale)
+# - Normalizes split init layouts (init symlink or two init scripts) to one real
+#   /etc/init.d/tailscaled while tailscaled is stopped. Never creates init symlinks.
 # - Resolves symlinks before overwriting to avoid breaking tailscale.multicall layouts
 # - Downloads latest stable Tailscale tarball from pkgs.tailscale.com
 # - Backs up current binaries, init script, and /etc/tailscale/
+# - Stops tailscaled through its owning procd service and guards against respawn
 # - Replaces tailscale and tailscaled at their detected real paths
-# - Restarts the Tailscale init script
+# - Starts tailscaled and verifies one owner, one pid, and the node address on tailscale0
 # - Adds key files to /etc/sysupgrade.conf
 #
 # Migration mode (--migrate-from-apk-multicall --yes-i-have-lan-access):
@@ -58,6 +61,21 @@ HAS_INIT=0
 MULTICALL_LAYOUT=0
 GITHUB_LATEST_VERSION="unknown"
 GITHUB_RELEASE_URL="https://api.github.com/repos/tailscale/tailscale/releases/latest"
+
+# Init script ownership. The canonical layout is one real
+# /etc/init.d/tailscaled. Init symlinks are never created.
+CANON_INIT_NAME="tailscaled"
+CANON_INIT="/etc/init.d/$CANON_INIT_NAME"
+ALT_INIT="/etc/init.d/tailscale"
+TAILSCALED_INIT=""
+NEED_INIT_NORMALIZE=0
+INIT_LAYOUT_PROBLEM=""
+VERIFY_MARK=""
+
+# procd's default respawn timeout is 5 s. Both waits must exceed it.
+RESPAWN_GUARD="${RESPAWN_GUARD:-7}"
+VERIFY_SETTLE="${VERIFY_SETTLE:-15}"
+VERIFY_ADDR_TIMEOUT="${VERIFY_ADDR_TIMEOUT:-30}"
 
 mkdir -p "$STATE_DIR" "$BACKUP_DIR"
 
@@ -707,17 +725,306 @@ probe_tailscale_binaries() {
     [ -n "$TAILSCALED_BIN" ] && HAS_TAILSCALED_BIN=1
 }
 
-probe_init_script() {
-    TAILSCALED_INIT=""
-    HAS_INIT=0
+# ---------------------------------------------------------------
+# Init script ownership
+#
+# OpenWrt rc.common names the procd service basename(readlink <invoked path>),
+# one link level only. An init script reachable under two names (a symlink,
+# or two scripts) gives one daemon two procd identities: stop acts on the
+# wrong one, procd respawns the other, and a duplicate tailscaled's startup
+# cleanup strips the live daemon's tailscale0 addresses. Everything below
+# keeps exactly one owner.
+# ---------------------------------------------------------------
 
-    if [ -x /etc/init.d/tailscaled ]; then
-        TAILSCALED_INIT="/etc/init.d/tailscaled"
-        HAS_INIT=1
-    elif [ -x /etc/init.d/tailscale ]; then
-        TAILSCALED_INIT="/etc/init.d/tailscale"
+# Single init resolver. Prefers the canonical name, falls back to the package name.
+resolve_init_script() {
+    TAILSCALED_INIT=""
+    if [ -x "$CANON_INIT" ]; then
+        TAILSCALED_INIT="$CANON_INIT"
+    elif [ -x "$ALT_INIT" ]; then
+        TAILSCALED_INIT="$ALT_INIT"
+    fi
+    [ -n "$TAILSCALED_INIT" ]
+}
+
+# procd service name that rc.common registers when this init path is invoked.
+# Mirrors rc.common: basescript=$(readlink "$initscript");
+#                    name=$(basename ${basescript:-$initscript})
+init_service_name() {
+    _isn_t="$(readlink "$1" 2>/dev/null || true)"
+    basename "${_isn_t:-$1}"
+}
+
+# PIDs procd reports for a service. Empty if absent or not running.
+# ubus prints instance pids as lines like: "pid": 9330,
+service_pids() {
+    ubus call service list "{\"name\":\"$1\"}" 2>/dev/null \
+        | grep -o '"pid": *[0-9]*' | grep -o '[0-9]*$' || true
+}
+
+# Success if procd holds any instance for this service, running or crashed.
+service_registered() {
+    ubus call service list "{\"name\":\"$1\"}" 2>/dev/null | grep -q '"instances"'
+}
+
+# Names of procd services whose instance PID is a running tailscaled.
+tailscaled_owner_services() {
+    _tos_pids=" $(pidof tailscaled 2>/dev/null || true) "
+    for _tos_n in tailscale tailscaled; do
+        for _tos_p in $(service_pids "$_tos_n"); do
+            case "$_tos_pids" in
+                *" $_tos_p "*) echo "$_tos_n" ;;
+            esac
+        done
+    done
+}
+
+# Service names that boot will register, one per rc.d start link.
+# Invoked via /etc/rc.d/S80tailscaled, rc.common reads ONE level of link:
+# ../init.d/tailscaled -> "tailscaled", even if init.d/tailscaled is itself a
+# symlink. That single-level read is what produced the split identity.
+boot_service_names() {
+    for _bsn_l in /etc/rc.d/S*tailscale /etc/rc.d/S*tailscaled; do
+        [ -L "$_bsn_l" ] || continue
+        basename "$(readlink "$_bsn_l")"
+    done
+}
+
+# Returns 0 when the layout is safe. Otherwise sets INIT_LAYOUT_PROBLEM and
+# returns 1. Requires TAILSCALED_INIT to be resolved first.
+detect_init_layout_problem() {
+    INIT_LAYOUT_PROBLEM=""
+
+    if [ -L "$CANON_INIT" ] || [ -L "$ALT_INIT" ]; then
+        INIT_LAYOUT_PROBLEM="init script symlink (one daemon, two procd service names)"
+    elif [ -x "$CANON_INIT" ] && [ -x "$ALT_INIT" ]; then
+        INIT_LAYOUT_PROBLEM="two separate Tailscale init scripts"
+    fi
+
+    _dilp_m="$(init_service_name "$TAILSCALED_INIT")"
+    for _dilp_b in $(boot_service_names); do
+        [ "$_dilp_b" = "$_dilp_m" ] && continue
+        INIT_LAYOUT_PROBLEM="${INIT_LAYOUT_PROBLEM:+$INIT_LAYOUT_PROBLEM; }boot registers '$_dilp_b' but $TAILSCALED_INIT registers '$_dilp_m'"
+    done
+
+    [ -z "$INIT_LAYOUT_PROBLEM" ]
+}
+
+# Refuse to proceed with duplicate or unmanaged daemons.
+check_tailscaled_ownership() {
+    _cto_pids="$(pidof tailscaled 2>/dev/null || true)"
+    # Word splitting is intended: one positional parameter per pid.
+    # shellcheck disable=SC2086
+    set -- $_cto_pids
+
+    if [ "$#" -gt 1 ]; then
+        die "Multiple tailscaled processes running ($_cto_pids). Resolve this before updating."
+    fi
+
+    if [ "$#" -eq 1 ]; then
+        _cto_owner="$(tailscaled_owner_services | sort -u)"
+        if [ -z "$_cto_owner" ]; then
+            die "tailscaled (pid $1) is not owned by any procd service. Refusing to update an unmanaged daemon."
+        fi
+        vlog "Running tailscaled pid $1 is owned by procd service: $_cto_owner"
+    fi
+
+    return 0
+}
+
+# Wait up to $1 seconds for every tailscaled process to exit.
+wait_tailscaled_gone() {
+    _wtg_i=0
+    while pidof tailscaled >/dev/null 2>&1; do
+        _wtg_i=$((_wtg_i + 1))
+        if [ "$_wtg_i" -ge "$1" ]; then
+            return 1
+        fi
+        sleep 1
+    done
+    return 0
+}
+
+# Convert any split layout into one real $CANON_INIT. Daemon must be stopped.
+# Does nothing unless NEED_INIT_NORMALIZE=1, so a layout that is already a
+# single real /etc/init.d/tailscaled is never touched.
+normalize_init_layout() {
+    [ "$NEED_INIT_NORMALIZE" -eq 1 ] || return 0
+
+    if pidof tailscaled >/dev/null 2>&1; then
+        die "normalize_init_layout called while tailscaled is running"
+    fi
+
+    _nil_src=""
+    if [ -f "$CANON_INIT" ] && [ ! -L "$CANON_INIT" ]; then
+        _nil_src="$CANON_INIT"
+    elif [ -f "$ALT_INIT" ] && [ ! -L "$ALT_INIT" ]; then
+        _nil_src="$ALT_INIT"
+    else
+        die "No real init script file found to normalize from"
+    fi
+
+    _nil_bak="$STATE_DIR/init-backup-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$_nil_bak" || die "Failed to create $_nil_bak"
+    for _nil_f in "$CANON_INIT" "$ALT_INIT"; do
+        if [ -e "$_nil_f" ] || [ -L "$_nil_f" ]; then
+            cp -a "$_nil_f" "$_nil_bak/" || die "Failed to back up $_nil_f"
+        fi
+    done
+    log "Init scripts backed up to $_nil_bak"
+
+    # Drop every boot link for both names; enable recreates the right one.
+    rm -f /etc/rc.d/S*tailscale /etc/rc.d/K*tailscale \
+          /etc/rc.d/S*tailscaled /etc/rc.d/K*tailscaled
+
+    if [ "$_nil_src" != "$CANON_INIT" ]; then
+        cp "$_nil_src" "$CANON_INIT.new" || die "Failed to copy $_nil_src"
+        chmod 755 "$CANON_INIT.new" || die "Failed to chmod $CANON_INIT.new"
+        # mv over a symlink replaces the link itself, not its target
+        mv -f "$CANON_INIT.new" "$CANON_INIT" || die "Failed to install $CANON_INIT"
+    fi
+
+    if [ -e "$ALT_INIT" ] || [ -L "$ALT_INIT" ]; then
+        rm -f "$ALT_INIT" || die "Failed to retire $ALT_INIT"
+    fi
+
+    "$CANON_INIT" enable || die "Failed to enable $CANON_INIT"
+
+    TAILSCALED_INIT="$CANON_INIT"
+    NEED_INIT_NORMALIZE=0
+    log "Init layout normalized: single real $CANON_INIT, procd service '$CANON_INIT_NAME'"
+}
+
+stop_tailscaled() {
+    log "Stopping tailscaled"
+
+    _st_owners="$(tailscaled_owner_services | sort -u)"
+    if [ -n "$_st_owners" ]; then
+        for _st_n in $_st_owners; do
+            log "Removing procd service '$_st_n' (owner of the running tailscaled)"
+            ubus call service delete "{\"name\":\"$_st_n\"}" >/dev/null 2>&1 || true
+        done
+    elif [ -n "$TAILSCALED_INIT" ] && [ -x "$TAILSCALED_INIT" ]; then
+        "$TAILSCALED_INIT" stop >/dev/null 2>&1 || true
+    fi
+
+    # Clear any registered but not running Tailscale service, for example an
+    # instance procd left in a crash loop. start_tailscaled registers fresh.
+    for _st_n in tailscale tailscaled; do
+        if service_registered "$_st_n"; then
+            ubus call service delete "{\"name\":\"$_st_n\"}" >/dev/null 2>&1 || true
+        fi
+    done
+
+    if ! wait_tailscaled_gone 10; then
+        log "tailscaled still running after procd stop, sending SIGTERM"
+        killall tailscaled 2>/dev/null || true
+        if ! wait_tailscaled_gone 5; then
+            log "tailscaled still running, sending SIGKILL"
+            killall -9 tailscaled 2>/dev/null || true
+            wait_tailscaled_gone 3 || die "tailscaled could not be stopped"
+        fi
+    fi
+
+    # Respawn guard: a procd instance killed outside procd comes back after
+    # the respawn timeout. Abort BEFORE installing so the old version keeps
+    # running instead of two daemons fighting over the socket.
+    sleep "$RESPAWN_GUARD"
+    if pidof tailscaled >/dev/null 2>&1; then
+        die "tailscaled came back after stop (procd respawn). A service still owns it. Aborting before installing binaries; the old version is still running."
+    fi
+
+    log "tailscaled stopped"
+}
+
+start_tailscaled() {
+    # Never start while a daemon or a Tailscale procd service is still present.
+    if pidof tailscaled >/dev/null 2>&1; then
+        die "tailscaled is already running; refusing to start a second daemon"
+    fi
+    for _sta_n in tailscale tailscaled; do
+        if service_registered "$_sta_n"; then
+            die "procd service '$_sta_n' is still registered; refusing to start a second owner"
+        fi
+    done
+
+    normalize_init_layout
+
+    if [ -z "$TAILSCALED_INIT" ] || [ ! -x "$TAILSCALED_INIT" ]; then
+        die "No executable init script to start tailscaled"
+    fi
+
+    # Syslog marker so verification only inspects lines from this start.
+    VERIFY_MARK="tailscale-updater-verify-$$-$(date +%s)"
+    logger -t "$LOGTAG" "$VERIFY_MARK" 2>/dev/null || true
+
+    log "Starting tailscaled via $TAILSCALED_INIT (procd service: $(init_service_name "$TAILSCALED_INIT"))"
+    # enable is idempotent; it recreates the rc.d link if a sysupgrade dropped it
+    "$TAILSCALED_INIT" enable >/dev/null 2>&1 || true
+    # init start prints tailscaled --cleanup output; keep it off the terminal
+    "$TAILSCALED_INIT" start >/dev/null 2>&1 || die "$TAILSCALED_INIT start failed"
+}
+
+# Pass condition for every start. tailscale status alone can pass while the
+# node address is already gone from tailscale0.
+verify_tailscaled_running() {
+    log "Verifying tailscaled (waiting ${VERIFY_SETTLE}s past the procd respawn window)"
+    sleep "$VERIFY_SETTLE"
+
+    _vt_pids="$(pidof tailscaled 2>/dev/null || true)"
+    # shellcheck disable=SC2086
+    set -- $_vt_pids
+    if [ "$#" -ne 1 ]; then
+        die "Expected exactly one tailscaled process, found: ${_vt_pids:-none}"
+    fi
+    _vt_pid="$1"
+
+    _vt_want="$(init_service_name "$TAILSCALED_INIT")"
+    _vt_owner="$(tailscaled_owner_services | sort -u)"
+    if [ "$_vt_owner" != "$_vt_want" ]; then
+        die "tailscaled pid $_vt_pid is owned by '${_vt_owner:-none}', expected '$_vt_want'"
+    fi
+
+    for _vt_n in tailscale tailscaled; do
+        [ "$_vt_n" = "$_vt_want" ] && continue
+        if service_registered "$_vt_n"; then
+            die "Second procd service '$_vt_n' is registered alongside '$_vt_want'"
+        fi
+    done
+
+    # Backend must report its IPv4 AND the kernel must hold it on tailscale0.
+    # Uses the installed CLI path; TAILSCALE_BIN can still be a multicall link.
+    _vt_cli="${TAILSCALE_REAL:-tailscale}"
+    _vt_ip=""
+    _vt_i=0
+    while [ "$_vt_i" -lt "$VERIFY_ADDR_TIMEOUT" ]; do
+        _vt_ip="$("$_vt_cli" ip -4 2>/dev/null | head -n 1)"
+        if [ -n "$_vt_ip" ] && ip -4 addr show dev tailscale0 2>/dev/null | grep -qF "inet $_vt_ip/"; then
+            break
+        fi
+        _vt_i=$((_vt_i + 1))
+        sleep 1
+    done
+    [ -n "$_vt_ip" ] || die "tailscale ip -4 returned nothing (backend not Running?)"
+    if ! ip -4 addr show dev tailscale0 2>/dev/null | grep -qF "inet $_vt_ip/"; then
+        die "tailscale0 is missing $_vt_ip (dataplane not built)"
+    fi
+
+    if [ -n "$VERIFY_MARK" ] && \
+       logread 2>/dev/null | sed -n "/$VERIFY_MARK/,\$p" | \
+       grep -qE 'safesocket.Listen|stale Tailscale address|crash loop'; then
+        die "Duplicate tailscaled or procd crash loop detected in syslog since start"
+    fi
+
+    log "tailscaled verified: pid $_vt_pid, service '$_vt_want', $_vt_ip on tailscale0"
+}
+
+probe_init_script() {
+    HAS_INIT=0
+    if resolve_init_script; then
         HAS_INIT=1
     fi
+    return 0
 }
 
 # Classify install state without dying. Order: binaries (+ multicall via readlink -f), then init.
@@ -882,15 +1189,7 @@ detect_tailscale_paths_if_present() {
 }
 
 detect_tailscaled_service_if_present() {
-    if [ -x /etc/init.d/tailscaled ]; then
-        TAILSCALED_INIT="/etc/init.d/tailscaled"
-        return 0
-    fi
-    if [ -x /etc/init.d/tailscale ]; then
-        TAILSCALED_INIT="/etc/init.d/tailscale"
-        return 0
-    fi
-    return 1
+    resolve_init_script
 }
 
 detect_tailscale_paths() {
@@ -934,15 +1233,17 @@ detect_tailscale_paths() {
 }
 
 detect_tailscaled_service() {
-    if [ -x /etc/init.d/tailscaled ]; then
-        TAILSCALED_INIT="/etc/init.d/tailscaled"
-    elif [ -x /etc/init.d/tailscale ]; then
-        TAILSCALED_INIT="/etc/init.d/tailscale"
-    else
-        die "No Tailscale init script found. Expected /etc/init.d/tailscaled or /etc/init.d/tailscale"
+    resolve_init_script || die "No Tailscale init script found. Expected $CANON_INIT or $ALT_INIT"
+    vlog "Detected init script: $TAILSCALED_INIT (procd service: $(init_service_name "$TAILSCALED_INIT"))"
+
+    if ! detect_init_layout_problem; then
+        log "Init layout problem: $INIT_LAYOUT_PROBLEM"
+        log "Will normalize to a single real $CANON_INIT while tailscaled is stopped (not in --dry-run)"
+        NEED_INIT_NORMALIZE=1
     fi
 
-    vlog "Detected init script: $TAILSCALED_INIT"
+    check_tailscaled_ownership
+    return 0
 }
 
 preflight() {
@@ -1397,17 +1698,42 @@ install_binary_safe() {
     chmod +x "$DEST"
 }
 
+# Success if the extracted backup holds this init path as a regular file.
+# Backups made on a migrated router can hold /etc/init.d/tailscaled as a
+# symlink. A symlink member is never restored: -f would follow its
+# absolute target on the live system, and copying it recreates the split layout.
+backup_has_init_file() {
+    [ -n "$1" ] || return 1
+    [ -f "${ROLLBACK_TMP}$1" ] && [ ! -L "${ROLLBACK_TMP}$1" ]
+}
+
 restore_init_from_backup() {
     INIT_DEST="$1"
     INIT_SRC="${ROLLBACK_TMP}${INIT_DEST}"
 
     [ -n "$INIT_DEST" ] || return 1
+    if [ -L "$INIT_SRC" ]; then
+        log "Backup holds $INIT_DEST as a symlink; not restoring it"
+        return 1
+    fi
     [ -f "$INIT_SRC" ] || return 1
 
-    cp "$INIT_SRC" "$INIT_DEST" || die "Failed to restore init script to $INIT_DEST"
-    chmod +x "$INIT_DEST"
+    # Write beside the destination and mv, so a symlink at the destination is
+    # replaced instead of followed.
+    cp "$INIT_SRC" "$INIT_DEST.new" || die "Failed to restore init script to $INIT_DEST"
+    chmod 755 "$INIT_DEST.new" || die "Failed to chmod $INIT_DEST.new"
+    mv -f "$INIT_DEST.new" "$INIT_DEST" || die "Failed to restore init script to $INIT_DEST"
     log "Init script restored: $INIT_DEST"
     return 0
+}
+
+# Checked before anything is stopped: rollback needs either an init file in
+# the backup or an init script already on the router.
+rollback_init_available() {
+    for _ria_c in "${RESTORE_INIT:-}" "$CANON_INIT" "$ALT_INIT"; do
+        backup_has_init_file "$_ria_c" && return 0
+    done
+    resolve_init_script
 }
 
 resolve_restore_init_from_backup() {
@@ -1415,12 +1741,20 @@ resolve_restore_init_from_backup() {
         return 0
     fi
 
-    for CAND in /etc/init.d/tailscaled /etc/init.d/tailscale; do
+    for CAND in "$CANON_INIT" "$ALT_INIT"; do
         if restore_init_from_backup "$CAND"; then
             RESTORE_INIT="$CAND"
             return 0
         fi
     done
+
+    # No init file in the backup (for example only the old symlink). Keep the
+    # init script already on the router; the layout check below handles it.
+    if resolve_init_script; then
+        log "Backup has no init script file to restore. Keeping current $TAILSCALED_INIT"
+        RESTORE_INIT="$TAILSCALED_INIT"
+        return 0
+    fi
 
     return 1
 }
@@ -1506,16 +1840,13 @@ do_rollback() {
     command -v readlink >/dev/null 2>&1 || die "readlink is missing"
     readlink -f / >/dev/null 2>&1 || die "readlink -f is not supported on this system"
 
-    # Stop daemon before restoring
-    log "Stopping tailscaled"
-    if [ -n "$RESTORE_INIT" ] && [ -x "$RESTORE_INIT" ]; then
-        "$RESTORE_INIT" stop 2>/dev/null || true
-    fi
-    sleep 3
-    if pidof tailscaled >/dev/null 2>&1; then
-        killall tailscaled 2>/dev/null || true
-        sleep 2
-    fi
+    # Fail before stopping anything if no init script will be usable afterwards.
+    rollback_init_available || \
+        die "Backup has no init script file and none is installed on the router. Nothing was changed."
+
+    # Stop through the owning procd service, same as an update.
+    resolve_init_script || TAILSCALED_INIT=""
+    stop_tailscaled
 
     # Restore binaries from backup
     ROLLBACK_TAILSCALE="${ROLLBACK_TMP}${RESTORE_TAILSCALE_REAL}"
@@ -1530,17 +1861,19 @@ do_rollback() {
     log "Binaries restored"
     "$RESTORE_TAILSCALE_REAL" version || die "Restored tailscale binary failed to run"
 
-    resolve_restore_init_from_backup || die "Init script not found in backup. Expected /etc/init.d/tailscaled or /etc/init.d/tailscale."
+    resolve_restore_init_from_backup || die "No init script in backup or on the router. Expected $CANON_INIT or $ALT_INIT."
 
-    # Restart
-    if [ -n "$RESTORE_INIT" ] && [ -x "$RESTORE_INIT" ]; then
-        "$RESTORE_INIT" enable 2>/dev/null || true
-        "$RESTORE_INIT" start || die "Failed to start tailscaled after rollback"
-    else
-        die "Init script from backup is missing or not executable: ${RESTORE_INIT:-unknown}"
+    # Old backups may contain the split layout. Re-resolve and normalize it
+    # (inside start_tailscaled) while the daemon is stopped.
+    resolve_init_script || die "No init script after restore"
+    if ! detect_init_layout_problem; then
+        log "Init layout problem: $INIT_LAYOUT_PROBLEM"
+        NEED_INIT_NORMALIZE=1
     fi
-    sleep 8
-    pidof tailscaled >/dev/null 2>&1 || die "tailscaled did not start after rollback"
+
+    TAILSCALE_REAL="$RESTORE_TAILSCALE_REAL"
+    start_tailscaled
+    verify_tailscaled_running
 
     log "Rollback complete. Running version: $("$RESTORE_TAILSCALE_REAL" version 2>/dev/null | awk 'NR==1 {print $1}')"
 
@@ -1630,27 +1963,6 @@ download_release() {
     log "Archive extracted and verified: $EXTRACT_DIR"
 }
 
-stop_tailscaled() {
-    log "Stopping tailscaled"
-
-    "$TAILSCALED_INIT" stop 2>/dev/null || true
-    sleep 3
-
-    if pidof tailscaled >/dev/null 2>&1; then
-        log "tailscaled still running, sending SIGTERM"
-        killall tailscaled 2>/dev/null || true
-        sleep 3
-    fi
-
-    if pidof tailscaled >/dev/null 2>&1; then
-        log "tailscaled still running, sending SIGKILL"
-        killall -9 tailscaled 2>/dev/null || true
-        sleep 2
-    fi
-
-    pidof tailscaled >/dev/null 2>&1 && die "tailscaled could not be stopped"
-}
-
 remove_apk_package() {
     log "Removing apk package entry for tailscale"
     log "Note: binaries and init script will be restored from backup if apk removes them"
@@ -1686,11 +1998,11 @@ ensure_kmod_tun() {
     log "kmod-tun OK"
 }
 
+# Deprecated 2026-10-29: init symlinks give one daemon two procd identities.
+# Kept as a shim so the migration path requests normalization
+# instead of creating a link; start_tailscaled performs it.
 ensure_init_compat_symlink() {
-    if [ -x /etc/init.d/tailscale ] && [ ! -e /etc/init.d/tailscaled ]; then
-        log "Creating compatibility symlink: /etc/init.d/tailscaled -> /etc/init.d/tailscale"
-        ln -sf /etc/init.d/tailscale /etc/init.d/tailscaled
-    fi
+    NEED_INIT_NORMALIZE=1
 }
 
 install_binaries() {
@@ -1701,19 +2013,6 @@ install_binaries() {
 
     log "Installed binaries:"
     "$TAILSCALE_REAL" version || die "New tailscale binary failed to run"
-}
-
-start_tailscaled() {
-    log "Starting tailscaled"
-
-    "$TAILSCALED_INIT" enable 2>/dev/null || true
-    "$TAILSCALED_INIT" start || die "Failed to start tailscaled"
-
-    sleep 8
-
-    pidof tailscaled >/dev/null 2>&1 || die "tailscaled did not start"
-
-    log "tailscaled is running"
 }
 
 verify_install() {
@@ -1737,14 +2036,20 @@ ensure_sysupgrade_persistence() {
         "$TAILSCALE_REAL" \
         "$TAILSCALED_REAL" \
         "$TAILSCALED_INIT" \
-        /etc/init.d/tailscale \
-        /etc/init.d/tailscaled \
         /etc/tailscale/ \
         /usr/bin/tailscale-watchdog.sh \
         /usr/bin/openwrt-tailscale-updater \
         /root/tailscale-updater/
     do
         grep -qxF "$path" /etc/sysupgrade.conf || echo "$path" >> /etc/sysupgrade.conf
+    done
+
+    # Drop entries for init paths that no longer exist (for example a
+    # retired /etc/init.d/tailscale after normalization).
+    for path in "$CANON_INIT" "$ALT_INIT"; do
+        [ "$path" = "$TAILSCALED_INIT" ] && continue
+        [ -e "$path" ] && continue
+        sed -i "\\|^$path\$|d" /etc/sysupgrade.conf
     done
 
     log "sysupgrade persistence updated"
@@ -2098,6 +2403,8 @@ main() {
     find_latest_release
 
     if [ "$DRY_RUN" -eq 1 ]; then
+        DRY_OWNER="$(tailscaled_owner_services | sort -u | tr '\n' ' ' | sed 's/ *$//')"
+        [ -n "$DRY_OWNER" ] || DRY_OWNER="none"
         hr
         ui_step "Dry run only. No changes made."
         box \
@@ -2108,7 +2415,15 @@ main() {
             "Archive:           $ARCHIVE_NAME" \
             "tailscale:         $TAILSCALE_REAL" \
             "tailscaled:        $TAILSCALED_REAL" \
-            "Init script:       $TAILSCALED_INIT"
+            "Init script:       $TAILSCALED_INIT" \
+            "Init service:      $(init_service_name "$TAILSCALED_INIT")" \
+            "procd owner:       $DRY_OWNER"
+        if [ -n "$INIT_LAYOUT_PROBLEM" ]; then
+            ui_warn "INIT_LAYOUT_PROBLEM: $INIT_LAYOUT_PROBLEM"
+            ui_warn "A real update would normalize this to a single real $CANON_INIT."
+        else
+            ui_ok "INIT_LAYOUT_PROBLEM: none (init layout would not be changed)"
+        fi
         cleanup
         exit 0
     fi
@@ -2116,6 +2431,9 @@ main() {
     if [ "$CURRENT_VERSION" = "$LATEST_VERSION" ] && [ "$FORCE" -ne 1 ] && [ "$MIGRATE_MULTICALL" -ne 1 ] && [ "$SELECT_RELEASE" -ne 1 ]; then
         ui_ok "Already on latest version ($CURRENT_VERSION). Use --force to reinstall."
         logger -t "$LOGTAG" "Already on latest version ($CURRENT_VERSION). Use --force to reinstall." 2>/dev/null || true
+        if [ "$NEED_INIT_NORMALIZE" -eq 1 ]; then
+            ui_warn "Init layout problem was NOT fixed because no update ran. Use --force to normalize it."
+        fi
         cleanup
         exit 0
     fi
@@ -2138,6 +2456,8 @@ main() {
 
     install_binaries
     start_tailscaled
+    verify_tailscaled_running
+    # Extra signal only. verify_tailscaled_running is the pass condition.
     verify_install
     ensure_sysupgrade_persistence
     cleanup

@@ -124,7 +124,7 @@ Run with no arguments from SSH:
 |---|---|
 | *(none)* | Show menu (updater menu if installed, first-run install menu if not) |
 | `--force` | Reinstall even if already on latest version |
-| `--dry-run` | Show detected values and latest version without making changes |
+| `--dry-run` | Show detected values, latest version, init layout problems, and the owning procd service without making changes |
 | `--keep-tmp` | Keep downloaded files in `/tmp/tailscale-update` after install |
 | `--yes` / `-y` | Skip confirmation prompts (use with `--force` to skip the menu and update) |
 | `--verbose` | Show detailed detection and operation logs |
@@ -205,13 +205,16 @@ Run with no arguments from SSH:
 - Detects package manager (`apk` or `opkg`) by available command
 - Detects Tailscale binary paths dynamically, supports `/usr/sbin` and `/usr/bin` layouts
 - Detects init script name (`/etc/init.d/tailscaled` or `/etc/init.d/tailscale`)
+- Detects split init layouts (an init script symlink, two init scripts, or a boot link that registers a different procd service name) and normalizes them to one real `/etc/init.d/tailscaled` while `tailscaled` is stopped. See [Init Script Ownership](#init-script-ownership)
+- Refuses to update when more than one `tailscaled` is running, or when the running one is not owned by a procd service
 - Resolves symlinks with `readlink -f` before overwriting, and removes symlinks safely before installing separate binaries
 - Fetches latest stable version from `pkgs.tailscale.com/stable`
 - Verifies downloaded tarball checksum (`.sha256`) before extraction
 - Menu shows latest stable, release-candidate, and unstable versions (cached for 5 minutes)
 - Backs up current binaries, init script, and `/etc/tailscale/` before any change
-- Stops `tailscaled`, installs new binaries, restarts and verifies
-- Adds key paths to `/etc/sysupgrade.conf` for persistence across sysupgrade
+- Stops `tailscaled` through the procd service that owns it, then waits past the procd respawn timeout and aborts before installing if the daemon came back
+- Installs new binaries, starts `tailscaled`, and verifies the dataplane (see [Init Script Ownership](#init-script-ownership))
+- Adds key paths to `/etc/sysupgrade.conf` for persistence across sysupgrade, and drops entries for init paths that no longer exist
 
 ## What It Does NOT Do
 
@@ -260,9 +263,9 @@ Migration mode converts an apk-managed multicall Tailscale install to standalone
 5. Removes the apk package entry with `apk del tailscale`
 6. Restores the init script if apk removed it
 7. Reinstalls `kmod-tun` if apk removed it as a dependency
-8. Creates `/etc/init.d/tailscaled` compatibility symlink if needed
-9. Installs separate upstream `tailscale` and `tailscaled` binaries
-10. Starts `tailscaled` and verifies
+8. Installs separate upstream `tailscale` and `tailscaled` binaries
+9. Normalizes the init script to one real `/etc/init.d/tailscaled` (the package script is copied, the original is backed up and removed; no symlink is created)
+10. Starts `tailscaled` and verifies the dataplane
 11. Updates `/etc/sysupgrade.conf`
 
 **Node identity is preserved.** `/etc/tailscale/` is not touched. No re-auth required.
@@ -274,6 +277,36 @@ Migration mode converts an apk-managed multicall Tailscale install to standalone
 ```
 
 After migration, use this updater for all future Tailscale updates. Do not use `apk upgrade tailscale`.
+
+---
+
+## Init Script Ownership
+
+OpenWrt `rc.common` names the procd service after the target of the init script path it was called through, one link level only. If the same init script can be reached under two names, one `tailscaled` can end up registered under two procd service names. Then `/etc/init.d/tailscaled stop` acts on the wrong name, procd respawns the daemon under the other name, and a duplicate `tailscaled` can remove the running daemon's addresses from `tailscale0`.
+
+Earlier versions of migration mode created `/etc/init.d/tailscaled` as a symlink to `/etc/init.d/tailscale`, which produces exactly this layout. The updater no longer creates init symlinks.
+
+**Normalization.** The canonical layout is one real file at `/etc/init.d/tailscaled`. If the updater finds an init script symlink, both `/etc/init.d/tailscale` and `/etc/init.d/tailscaled`, or a boot link (`/etc/rc.d/S*`) that registers a different service name than the init script, it normalizes during the update while `tailscaled` is stopped:
+
+1. Backs up both init paths to `/root/tailscale-updater/init-backup-<timestamp>/`
+2. Removes the Tailscale boot links in `/etc/rc.d/`
+3. Writes one real `/etc/init.d/tailscaled` (copied from the existing real script) and removes `/etc/init.d/tailscale`
+4. Runs `/etc/init.d/tailscaled enable`
+
+A router that already has one real `/etc/init.d/tailscaled` is not touched. A plain package install with only `/etc/init.d/tailscale` is also left as is. `--dry-run` reports the problem and the owning procd service but never normalizes. If the router is already on the latest version, no update runs and nothing is normalized; use `--force` to normalize.
+
+**Stop.** The updater finds the procd service whose instance PID is the running `tailscaled` and removes that service (`ubus call service delete`), plus any Tailscale service procd still holds in a crash loop. `killall` is only a last resort. It then waits longer than the procd respawn timeout (5 seconds by default) and aborts before installing anything if `tailscaled` came back. The old version keeps running in that case.
+
+**Start.** The updater refuses to start `tailscaled` if any `tailscaled` process or Tailscale procd service still exists.
+
+**Verification.** `tailscale status` alone is not enough: it can succeed while the dataplane is broken. After the respawn window the updater requires:
+
+- exactly one `tailscaled` process
+- owned by exactly one procd service, matching the init script
+- the node's IPv4 from `tailscale ip -4` present on `tailscale0`
+- no `safesocket.Listen`, `stale Tailscale address`, or procd `crash loop` lines in syslog since the start
+
+If any check fails, the update stops with an error. The node must be logged in and running, with a `tailscale0` interface, for verification to pass. Update, migration, and rollback all use the same stop, start, and verification steps.
 
 ---
 
@@ -295,8 +328,13 @@ Downloaded tarballs are verified against the matching `.sha256` checksum from th
 tailscale version
 tailscale status
 pidof tailscaled
-ip link show tailscale0
+ip -4 addr show dev tailscale0
+ls -l /etc/init.d/tailscale* /etc/rc.d/*tailscale*
+ubus call service list '{"name":"tailscaled"}'
+ubus call service list '{"name":"tailscale"}'
 ```
+
+Expect one PID, one real init file, and one procd service listing that PID.
 
 Reapply your preferred router state if needed:
 
@@ -323,6 +361,8 @@ Select backup to restore [1-2]:
 ```
 
 Rollback restores the `tailscale` and `tailscaled` binaries and the init script using paths recorded in the backup. Node identity at `/etc/tailscale/` is not touched.
+
+Backups taken on a router with the old init symlink contain that symlink. Rollback never restores an init symlink: it keeps the init script already on the router and normalizes the layout if needed. Rollback checks that a usable init script exists before it stops anything, then stops, starts, and verifies `tailscaled` the same way an update does.
 
 Backups created by v1.4.0-rc1 and later include `.tailscale-backup-meta` inside the tarball (binary paths, init script, version, multicall flag). A readable copy is also written beside the archive as `tailscale-backup-<version>-<timestamp>.tar.gz.meta`.
 
